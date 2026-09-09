@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: upwork-kenya
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      # --- KCB Buni M-Pesa STK push (set these in the Render dashboard) ---
+      - key: KCB_CONSUMER_KEY
+        sync: false
+      - key: KCB_CONSUMER_SECRET
+        sync: false
+      - key: KCB_TOKEN_ENDPOINT
+        value: https://api.buni.kcbgroup.com/token
+      - key: KCB_STKPUSH_ENDPOINT
+        value: https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush
+      - key: KCB_SHORT_CODE
+        value: '522522'
+      - key: KCB_TILL_NUMBER
+        sync: false
+      - key: KCB_PASSKEY
+        value: ''
+      - key: CALLBACK_URL
+        value: https://upworkkenyabackend.onrender.com/api/pay/kcb/callback
