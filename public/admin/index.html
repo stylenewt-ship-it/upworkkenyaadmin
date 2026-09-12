@@ -244,7 +244,7 @@ async function viewPays(){
         <tr><td><b>${esc(p.user)}</b><div style="font-size:11px;color:var(--muted)">${esc(p.email)}</div></td>
         <td><span class="pill p-blue">${esc(p.purpose)}${p.packageKey?' · '+esc(p.packageKey):''}</span></td>
         <td><b>${money(p.amount)}</b></td><td>${esc(p.phone)}</td>
-        <td><span class="pill ${cls(p.status)}">${esc(p.status)}</span></td>
+        <td><span class="pill ${cls(p.status)}">${esc(p.status)}</span>${p.manualReview?' <span class="pill p-amber" title="Completed with a user-entered SMS code while the gateway status was unavailable — verify against your M-Pesa statement">check</span>':''}</td>
         <td style="font-weight:700">${esc(p.receipt||'—')}</td>
         <td style="font-size:12px;color:var(--muted)">${esc(p.reference)}</td><td>${ago(p.at)}</td></tr>`).join('')}</tbody></table>`
       : '<p style="color:var(--muted);padding:14px">No M-Pesa transactions yet.</p>'}

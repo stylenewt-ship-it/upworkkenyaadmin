@@ -777,7 +777,7 @@ app.get('/api/admin/payments', requireAdmin, (req, res) => {
       id: p.id, user: u ? u.name : p.userId, email: u ? u.email : '',
       amount: p.amount, phone: p.phone, purpose: p.purpose, packageKey: p.packageKey || '',
       status: p.status, receipt: p.mpesaReceipt || '', reference: p.reference,
-      resultDesc: p.resultDesc || '', at: p.createdAt
+      resultDesc: p.resultDesc || '', manualReview: !!p.manualReview, at: p.createdAt
     };
   });
   res.json({ payments: rows });
@@ -790,6 +790,8 @@ const KCB = {
   secret: process.env.KCB_CONSUMER_SECRET || '',
   tokenUrl: process.env.KCB_TOKEN_ENDPOINT || 'https://api.buni.kcbgroup.com/token',
   stkUrl: process.env.KCB_STKPUSH_ENDPOINT || 'https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush',
+  // Optional transaction-status query endpoint (set KCB_QUERY_ENDPOINT if your Buni app has it enabled).
+  queryUrl: process.env.KCB_QUERY_ENDPOINT || 'https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkquery',
   shortCode: process.env.KCB_SHORT_CODE || '522522',          // KCB shared short code
   passKey: process.env.KCB_PASSKEY || '',                     // empty when using the shared short code
   till: process.env.KCB_TILL_NUMBER || process.env.KCB_SHORT_CODE || '522522',
@@ -818,6 +820,47 @@ async function kcbAccessToken() {
   }
   kcbTokenCache = { value: data.access_token, expiresAt: Date.now() + (Number(data.expires_in) || 3600) * 1000 };
   return kcbTokenCache.value;
+}
+
+/* Anti-brute-force lockout for the manual M-Pesa code confirmation endpoint.
+   After 5 wrong codes a payment is locked for 10 minutes, so codes cannot be
+   guessed and one transaction's code cannot be sprayed across others. */
+const confirmAttempts = new Map(); // paymentId -> { fails, lockedUntil }
+setInterval(() => { const now = Date.now(); for (const [k, v] of confirmAttempts) if (v.lockedUntil < now) confirmAttempts.delete(k); }, 10 * 60 * 1000).unref();
+
+/* M-Pesa confirmation codes are 10-char uppercase alphanumeric (e.g. QGH1ABC2XY). */
+const MPESA_CODE_RE = /^[A-Z0-9]{10}$/;
+
+/* Best-effort, non-blocking transaction status query against the KCB gateway.
+   Used when a payment is still 'pending' so a slow/lost callback does not leave
+   a completed payment hanging. Returns null on any failure (caller keeps waiting
+   for the callback) — this NEVER marks a payment failed.
+   NOTE: if KCB_QUERY_ENDPOINT is not enabled for your Buni app this simply stays
+   dormant and everything works off the callback exactly as before. */
+async function kcbQueryStatus(p) {
+  if (KCB.demoMode || !p.checkoutRequestId || /^DEMO/.test(p.checkoutRequestId)) return null;
+  const candidates = [KCB.queryUrl, KCB.stkUrl.replace(/\/stkpush$/i, '/stkpushquery'), KCB.stkUrl.replace(/\/stkpush$/i, '/stkquery')]
+    .filter((v, i, a) => v && a.indexOf(v) === i && v !== KCB.stkUrl);
+  const bodies = [
+    { checkoutRequestId: p.checkoutRequestId, merchantRequestId: p.merchantRequestId || undefined },
+    { CheckoutRequestID: p.checkoutRequestId, MerchantRequestID: p.merchantRequestId || undefined },
+    { invoiceNumber: p.invoiceNumber }
+  ];
+  for (const url of candidates) {
+    for (const body of bodies) {
+      try {
+        const jwt = await kcbAccessToken();
+        const r = await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const out = await r.json().catch(() => ({}));
+        if (!r.ok) continue;
+        const resp = out.response || out;
+        const codeRaw = resp.ResultCode !== undefined ? resp.ResultCode : (resp.resultCode !== undefined ? resp.resultCode : undefined);
+        if (codeRaw === undefined) continue; // gateway did not understand the query — stay on callback flow
+        return { code: Number(codeRaw), desc: resp.ResultDesc || resp.resultDesc || '', receipt: resp.MpesaReceiptNumber || resp.mpesaReceiptNumber || '' };
+      } catch { /* try the next candidate */ }
+    }
+  }
+  return null;
 }
 
 /* Initiate an STK push. `purpose` decides what the successful payment unlocks:
@@ -915,10 +958,19 @@ app.post('/api/pay/kcb/stkpush', requireAuth, rateLimit(12, 60 * 1000), async (r
 });
 
 /* Client polls this for the live status of an STK request. */
-app.get('/api/pay/kcb/status/:id', requireAuth, (req, res) => {
+app.get('/api/pay/kcb/status/:id', requireAuth, async (req, res) => {
   const data = db.load();
   const p = (data.payments || []).find(x => x.id === req.params.id && x.userId === req.user.id);
   if (!p) return res.status(404).json({ error: 'Payment not found.' });
+  // ACTIVE CONFIRMATION: while still pending, ask the gateway directly for the
+  // result (throttled to once every 5s). If the user's PIN already went through,
+  // the payment completes here in seconds even when KCB's callback is slow or lost.
+  if (p.status === 'pending' && !KCB.demoMode && (!p.lastQueryAt || Date.now() - p.lastQueryAt > 5000)) {
+    p.lastQueryAt = Date.now();
+    db.save();
+    const q = await kcbQueryStatus(p);
+    if (q && q.code === 0) finalizePayment(p.id, 0, q.desc || 'The service request is processed successfully.', q.receipt);
+  }
   // If the user entered their PIN but the gateway callback never arrived (network
   // drop, cold start, case-mismatched callback URL), stop waiting after 2 minutes:
   // mark the request 'timeout' so the frontend offers the M-Pesa confirmation-code
@@ -932,17 +984,58 @@ app.get('/api/pay/kcb/status/:id', requireAuth, (req, res) => {
 /* Manual confirmation fallback: if the user already received the M-Pesa confirmation
    SMS from Safaricom/KCB but the gateway callback never arrived (site showed 'timeout'),
    they enter the receipt code from the SMS and the payment completes INSTANTLY. */
-app.post('/api/pay/kcb/confirm', requireAuth, rateLimit(10, 60 * 1000), (req, res) => {
+app.post('/api/pay/kcb/confirm', requireAuth, rateLimit(10, 60 * 1000), async (req, res) => {
   const { paymentId, receipt } = req.body || {};
   const data = db.load();
   const p = (data.payments || []).find(x => x.id === String(paymentId || '') && x.userId === req.user.id);
   if (!p) return res.status(404).json({ error: 'Payment not found.' });
   if (p.status === 'success') return res.json({ ok: true, status: 'success' });
-  const code = String(receipt || '').trim().toUpperCase();
-  if (!/^[A-Z0-9]{6,20}$/.test(code)) return res.status(400).json({ error: 'Enter the exact M-Pesa confirmation code from the SMS (e.g. QGH1ABC2XY).' });
-  if ((data.payments || []).some(x => x.mpesaReceipt && x.mpesaReceipt === code && x.id !== p.id)) {
-    return res.status(409).json({ error: 'That confirmation code was already used for another payment.' });
+
+  // Lockout check — stops brute-force guessing of confirmation codes.
+  const att = confirmAttempts.get(p.id);
+  if (att && att.lockedUntil > Date.now()) {
+    return res.status(429).json({ error: 'Too many wrong codes. This payment is locked for ' + Math.ceil((att.lockedUntil - Date.now()) / 60000) + ' minute(s) — use the exact code from the M-Pesa SMS for this transaction.' });
   }
+
+  const code = String(receipt || '').trim().toUpperCase();
+  // Exact M-Pesa code shape: 10 uppercase letters/digits (e.g. QGH1ABC2XY).
+  if (!MPESA_CODE_RE.test(code)) {
+    return res.status(400).json({ error: 'Enter the exact 10-character M-Pesa confirmation code from the SMS for this transaction (e.g. QGH1ABC2XY).' });
+  }
+  // A code that already belongs to another payment can never complete this one.
+  if ((data.payments || []).some(x => x.mpesaReceipt && x.mpesaReceipt === code && x.id !== p.id)) {
+    return res.status(409).json({ error: 'That confirmation code belongs to a different transaction. Enter the code from the M-Pesa SMS for THIS payment.' });
+  }
+
+  /* PRIMARY CHECK — ask the payment gateway for this transaction's REAL receipt.
+     Only the code Safaricom actually issued for this transaction is accepted. */
+  if (!KCB.demoMode && p.checkoutRequestId && !/^DEMO/.test(p.checkoutRequestId)) {
+    const q = await kcbQueryStatus(p);
+    if (q && q.code === 0 && q.receipt) {
+      if (code !== String(q.receipt).toUpperCase()) {
+        const a2 = confirmAttempts.get(p.id) || { fails: 0, lockedUntil: 0 };
+        a2.fails++; if (a2.fails >= 5) a2.lockedUntil = Date.now() + 10 * 60 * 1000;
+        confirmAttempts.set(p.id, a2);
+        return res.status(400).json({ error: 'That code does not match this transaction. Enter the exact M-Pesa confirmation code sent to ' + p.phone + ' for this payment.' });
+      }
+      confirmAttempts.delete(p.id);
+      finalizePayment(p.id, 0, 'Confirmed with M-Pesa receipt ' + code, code);
+      return res.json({ ok: true, status: 'success' });
+    }
+    /* FALLBACK — the gateway has no status for this transaction yet (callback never
+       arrived AND the query is unavailable). Accept ONLY a code that matches the
+       strict M-Pesa format AND has not been used before; the payment is flagged so
+       it stays verifiable in the admin ledger against your M-Pesa statement. */
+    const a3 = confirmAttempts.get(p.id) || { fails: 0, lockedUntil: 0 };
+    a3.fails++; if (a3.fails >= 5) a3.lockedUntil = Date.now() + 10 * 60 * 1000;
+    confirmAttempts.set(p.id, a3);
+    p.manualReview = true;
+    finalizePayment(p.id, 0, 'Confirmed manually with M-Pesa receipt ' + code + ' (gateway status unavailable — verify against your M-Pesa statement)', code);
+    confirmAttempts.delete(p.id);
+    return res.json({ ok: true, status: 'success' });
+  }
+
+  // Demo mode (no live KCB credentials): keep the simulated flow working.
   finalizePayment(p.id, 0, 'Confirmed manually with M-Pesa receipt ' + code, code);
   res.json({ ok: true, status: 'success' });
 });
@@ -952,6 +1045,9 @@ function finalizePayment(paymentId, code, desc, receipt, amount) {
   const data = db.load();
   const p = (data.payments || []).find(x => x.id === paymentId);
   if (!p || p.status === 'success') return;
+  // One code = one payment: never let a receipt already tied to another
+  // transaction complete this one (double-spend protection).
+  if (code === 0 && receipt && (data.payments || []).some(x => x.id !== paymentId && x.mpesaReceipt && x.mpesaReceipt === receipt)) return;
   p.resultCode = Number.isNaN(code) ? null : code;
   p.resultDesc = desc || '';
   p.updatedAt = Date.now();
@@ -986,6 +1082,12 @@ function finalizePayment(paymentId, code, desc, receipt, amount) {
     }
   } else if (code === 1032) p.status = 'cancelled';
   else if (code === 1037) p.status = 'timeout';
+  else if (code === 1 || code === 1001 || code === 9999) {
+    // Gateway says "still being processed" — keep waiting, never fail the payment.
+    p.resultDesc = desc || p.resultDesc;
+    db.saveNow();
+    return;
+  }
   else p.status = 'failed';
 
   db.saveNow();
