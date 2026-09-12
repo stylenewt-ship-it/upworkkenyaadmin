@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>Admin — Upwork Kenya</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <style>
@@ -192,15 +192,22 @@ async function adjust(id){
 
 async function viewWd(){
   const r = await api('/api/admin/withdrawals');
+  const pillCls = s => (s==='cleared'||s==='paid')?'p-green':s==='approved'?'p-blue':s==='rejected'?'p-red':'p-amber';
+  const lbl = s => s==='paid'?'cleared':s;
   $('main').innerHTML = `
     <div class="h1">Withdrawal requests</div>
+    <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Flow: <b>pending</b> → <b>Approve</b> it → send the money from your phone (M-Pesa) → <b>Mark cleared</b>. Rejecting refunds the user's wallet.</p>
     <div class="card" style="padding:6px 12px;overflow-x:auto">
       ${r.withdrawals.length ? `<table><thead><tr><th>User</th><th>Amount</th><th>M-Pesa</th><th>Status</th><th>Requested</th><th>Actions</th></tr></thead>
       <tbody>${r.withdrawals.map(w=>`
         <tr><td>${esc(w.userId)}</td><td><b>${money(w.amount)}</b></td><td>${esc(w.phone)}</td>
-        <td><span class="pill ${w.status==='paid'?'p-green':w.status==='rejected'?'p-red':'p-amber'}">${w.status}</span></td>
+        <td><span class="pill ${pillCls(w.status)}">${lbl(w.status)}</span></td>
         <td>${ago(w.at)}</td>
-        <td>${w.status==='pending'?`<button class="btn btn-primary btn-sm" onclick="wd('${w.id}','paid')">Mark paid</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`:'—'}</td></tr>`).join('')}</tbody></table>`
+        <td style="white-space:nowrap">${w.status==='pending'
+          ? `<button class="btn btn-primary btn-sm" onclick="wd('${w.id}','approved')">Approve</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
+          : w.status==='approved'
+            ? `<button class="btn btn-primary btn-sm" onclick="wd('${w.id}','cleared')">✓ Mark cleared (money sent)</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
+            : '—'}</td></tr>`).join('')}</tbody></table>`
       : '<p style="color:var(--muted);padding:14px">No withdrawal requests yet.</p>'}
     </div>`;
 }
@@ -219,6 +226,9 @@ async function viewAsg(){
       : '<p style="color:var(--muted);padding:14px">No submissions yet.</p>'}
     </div>`;
 }
+/* Keep the free-tier backend (and the Neon database connection) awake while the admin panel is open. */
+setInterval(function(){ fetch('/api/health').catch(function(){}); }, 10 * 60 * 1000);
+fetch('/api/health').catch(function(){});
 </script>
 </body>
 </html>

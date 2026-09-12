@@ -5,6 +5,7 @@
  * Express + pure-JS JSON datastore. No native modules -> builds cleanly on Render.
  */
 
+try { require('dotenv').config(); } catch { /* dotenv optional — env vars may come from the host */ }
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
@@ -16,7 +17,8 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '11upwork72';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'upwork-ke-dev-secret-change-me';
 
-app.use(express.json({ limit: '2mb' }));
+/* 10mb: profile photos uploaded from the device travel as base64 data URLs. */
+app.use(express.json({ limit: '10mb' }));
 
 /* CORS: allow the frontend (any origin) to call this API. No behaviour change for same-origin. */
 app.use((req, res, next) => {
@@ -189,7 +191,13 @@ app.put('/api/profile', requireAuth, (req, res) => {
   if (bio !== undefined) u.bio = String(bio).slice(0, 500);
   if (Array.isArray(skills)) u.skills = skills.map(s => String(s).slice(0, 40)).slice(0, 12);
   if (experience !== undefined) u.experience = String(experience).slice(0, 500);
-  if (avatar !== undefined) u.avatar = String(avatar).slice(0, 300);
+  if (avatar !== undefined) {
+    const a = String(avatar);
+    // Device uploads arrive as base64 data: URLs; plain https links still accepted.
+    if (a === '' || /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(a) || /^https?:\/\//i.test(a)) {
+      u.avatar = a.slice(0, 700000); // ~500KB of base64 — plenty for a 320px profile photo
+    }
+  }
   db.save();
   res.json({ user: publicUser(u) });
 });
@@ -474,13 +482,20 @@ app.post('/api/wallet/withdraw', requireAuth, (req, res) => {
   if (!phone || !/^(\+?254|0)\d{9}$/.test(String(phone).replace(/\s/g, ''))) {
     return res.status(400).json({ error: 'Enter a valid M-Pesa phone number (e.g. 0712345678).' });
   }
-  addTx(u.id, 'withdrawal', -amt, `Withdrawal to M-Pesa ${phone} (processing)`);
+  addTx(u.id, 'withdrawal', -amt, `Withdrawal to M-Pesa ${phone} (pending approval)`);
   const data2 = db.load();
   data2.withdrawals = data2.withdrawals || [];
   data2.withdrawals.unshift({ id: db.uid('wd'), userId: u.id, amount: amt, phone: String(phone), status: 'pending', at: Date.now() });
-  notify(u.id, `Withdrawal of KES ${amt} received. Payouts are processed within 24 hours.`, 'info');
+  notify(u.id, `Withdrawal of KES ${amt} received and sent for approval. Track its status (pending → approved → cleared) in your Wallet.`, 'info');
   db.saveNow();
   res.json({ ok: true, wallet: u.wallet });
+});
+
+/* User tracks their own withdrawal requests: pending → approved → cleared. */
+app.get('/api/wallet/withdrawals', requireAuth, (req, res) => {
+  const data = db.load();
+  const mine = (data.withdrawals || []).filter(w => w.userId === req.user.id);
+  res.json({ withdrawals: mine.slice(0, 30) });
 });
 
 /* ------------------------------- marketplace ------------------------------- */
@@ -628,12 +643,33 @@ app.get('/api/admin/withdrawals', requireAdmin, (req, res) => {
   res.json({ withdrawals: (data.withdrawals || []).slice(0, 100) });
 });
 
+/* Withdrawal lifecycle: pending → approved (admin okays it) → cleared (admin has sent
+   the money manually from their phone). 'rejected' refunds the wallet. 'paid' is kept
+   as a backward-compatible alias of 'cleared'. */
 app.post('/api/admin/withdrawals/:id', requireAdmin, (req, res) => {
   const data = db.load();
   const w = (data.withdrawals || []).find(x => x.id === req.params.id);
   if (!w) return res.status(404).json({ error: 'Not found.' });
-  w.status = (req.body || {}).status === 'paid' ? 'paid' : 'rejected';
-  if (w.status === 'rejected') addTx(w.userId, 'refund', w.amount, 'Withdrawal rejected — funds returned');
+  let next = String((req.body || {}).status || '');
+  if (next === 'paid') next = 'cleared';
+  if (['approved', 'cleared', 'rejected'].indexOf(next) === -1) return res.status(400).json({ error: 'Invalid status.' });
+  if (w.status === 'cleared' || w.status === 'paid') return res.status(400).json({ error: 'Already cleared — money was sent.' });
+  if (w.status === 'rejected') return res.status(400).json({ error: 'Already rejected and refunded.' });
+  if (next === 'approved') {
+    if (w.status !== 'pending') return res.status(400).json({ error: 'Only pending requests can be approved.' });
+    w.status = 'approved';
+    w.approvedAt = Date.now();
+    notify(w.userId, `Your withdrawal of KES ${w.amount} was approved ✅ — the payout is being sent to M-Pesa ${w.phone}.`, 'success');
+  } else if (next === 'cleared') {
+    w.status = 'cleared';
+    w.clearedAt = Date.now();
+    notify(w.userId, `Your withdrawal of KES ${w.amount} has been SENT to M-Pesa ${w.phone} 💸. Check your phone — asante!`, 'success');
+  } else {
+    w.status = 'rejected';
+    w.rejectedAt = Date.now();
+    addTx(w.userId, 'refund', w.amount, 'Withdrawal rejected — funds returned');
+    notify(w.userId, `Your withdrawal of KES ${w.amount} was rejected and the funds were returned to your earnings wallet. Contact support if unsure.`, 'info');
+  }
   db.saveNow();
   res.json({ ok: true });
 });
@@ -749,7 +785,7 @@ app.post('/api/pay/kcb/stkpush', requireAuth, async (req, res) => {
       payment.checkoutRequestId = 'DEMO-CO-' + ref;
       payment.resultDesc = 'M-Pesa PIN prompt sent to ' + phone + '. Enter your PIN to complete.';
       db.saveNow();
-      setTimeout(() => finalizePayment(payment.id, 0, 'The service request is processed successfully.', 'MDX' + ref.slice(-6)), 6000);
+      setTimeout(() => finalizePayment(payment.id, 0, 'The service request is processed successfully.', 'MDX' + ref.slice(-6)), 2500);
       return res.json({ ok: true, paymentId: payment.id, message: payment.resultDesc, demo: true });
     }
 
@@ -803,6 +839,24 @@ app.get('/api/pay/kcb/status/:id', requireAuth, (req, res) => {
   res.json({ id: p.id, status: p.status, amount: p.amount, resultCode: p.resultCode, resultDesc: p.resultDesc, mpesaReceipt: p.mpesaReceipt, wallet: req.user.wallet });
 });
 
+/* Manual confirmation fallback: if the user already received the M-Pesa confirmation
+   SMS from Safaricom/KCB but the gateway callback never arrived (site showed 'timeout'),
+   they enter the receipt code from the SMS and the payment completes INSTANTLY. */
+app.post('/api/pay/kcb/confirm', requireAuth, (req, res) => {
+  const { paymentId, receipt } = req.body || {};
+  const data = db.load();
+  const p = (data.payments || []).find(x => x.id === String(paymentId || '') && x.userId === req.user.id);
+  if (!p) return res.status(404).json({ error: 'Payment not found.' });
+  if (p.status === 'success') return res.json({ ok: true, status: 'success' });
+  const code = String(receipt || '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{6,20}$/.test(code)) return res.status(400).json({ error: 'Enter the exact M-Pesa confirmation code from the SMS (e.g. QGH1ABC2XY).' });
+  if ((data.payments || []).some(x => x.mpesaReceipt && x.mpesaReceipt === code && x.id !== p.id)) {
+    return res.status(409).json({ error: 'That confirmation code was already used for another payment.' });
+  }
+  finalizePayment(p.id, 0, 'Confirmed manually with M-Pesa receipt ' + code, code);
+  res.json({ ok: true, status: 'success' });
+});
+
 /* Central success/failure handler used by both the KCB callback and the demo simulator. */
 function finalizePayment(paymentId, code, desc, receipt, amount) {
   const data = db.load();
@@ -850,7 +904,9 @@ function finalizePayment(paymentId, code, desc, receipt, amount) {
 /* KCB calls this with the final result (success / cancelled / timeout / failed). */
 app.post('/api/pay/kcb/callback', (req, res) => {
   try {
-    const cb = (((req.body || {}).Body || {}).stkCallback) || {};
+    const body = req.body || {};
+    let cb = ((body.Body || {}).stkCallback) || body.stkCallback || {};
+    if (cb.ResultCode === undefined && body.response && body.response.ResultCode !== undefined) cb = body.response;
     const merchantId = cb.MerchantRequestID || '';
     const checkoutId = cb.CheckoutRequestID || '';
     const code = Number(cb.ResultCode);
@@ -876,7 +932,19 @@ app.post('/api/pay/kcb/callback', (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
+/* --------------------------------- health ----------------------------------- */
+
+/* Used by the frontend/admin keep-alive ping (every 10 min) so the free-tier
+   server and the Neon connection never sleep; also handy for uptime checks. */
+app.get('/api/health', async (req, res) => {
+  let pg = false;
+  try { pg = await db.ping(); } catch {}
+  res.json({ ok: true, db: pg ? 'neon-postgres' : 'local-json', at: Date.now() });
+});
+
 /* --------------------------------- startup --------------------------------- */
 
-db.load(); // seed on boot
-app.listen(PORT, () => console.log(`Upwork Kenya running on port ${PORT}`));
+(async () => {
+  try { await db.init(); } catch (e) { console.error('[db] init error:', e.message); }
+  app.listen(PORT, () => console.log(`Upwork Kenya running on port ${PORT}`));
+})();

@@ -1,6 +1,6 @@
 {
   "name": "upwork-kenya",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Upwork Kenya - a freelance task marketplace connecting Kenyan freelancers with paid gigs",
   "main": "server.js",
   "engines": {
@@ -11,6 +11,8 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pg": "^8.13.1"
   }
 }
