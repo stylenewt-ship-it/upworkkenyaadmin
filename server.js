@@ -13,23 +13,78 @@ const db = require('./db');
 const { dailyTasksFor } = require('./tasks.seed');
 
 const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', 1); // correct client IPs behind Render's proxy (rate limiting)
 const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '11upwork72';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'upwork-ke-dev-secret-change-me';
+
+/* Secrets come ONLY from environment variables — nothing is hardcoded in the code.
+   If SESSION_SECRET is unset, a random one is generated at boot (logins reset on restart). */
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+
+/* Hidden admin path — set ADMIN_PATH on the host (e.g. "manage-x7k2q9"). The admin
+   panel is served ONLY at /<ADMIN_PATH>; when unset, the panel is fully disabled. */
+const ADMIN_PATH = String(process.env.ADMIN_PATH || '').replace(/^\/+|\/+$/g, '');
+
+/* CORS allow-list — set ALLOWED_ORIGINS on the host, comma-separated
+   (e.g. "https://your-frontend.netlify.app"). Same-origin requests (no Origin
+   header) always work. Every other cross-origin call is rejected by the browser. */
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 /* 10mb: profile photos uploaded from the device travel as base64 data URLs. */
 app.use(express.json({ limit: '10mb' }));
 
-/* CORS: allow the frontend (any origin) to call this API. No behaviour change for same-origin. */
+/* Security headers on every response. */
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-auth-token, x-admin-key');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  next();
+});
+
+/* CORS: only allow-listed frontend origins may call this API cross-origin. */
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, x-auth-token, x-admin-key');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+  }
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
+/* Lightweight in-memory rate limiter for sensitive endpoints (brute-force protection). */
+const rateBuckets = new Map();
+function rateLimit(max, windowMs) {
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip + '|' + req.path;
+    let b = rateBuckets.get(key);
+    if (!b || now - b.start > windowMs) { b = { start: now, count: 0 }; rateBuckets.set(key, b); }
+    if (++b.count > max) return res.status(429).json({ error: 'Too many attempts — please wait a minute and try again.' });
+    next();
+  };
+}
+setInterval(() => { const now = Date.now(); for (const [k, b] of rateBuckets) if (now - b.start > 15 * 60 * 1000) rateBuckets.delete(k); }, 10 * 60 * 1000).unref();
+
+/* Admin session tokens (in-memory, 12h, sliding). The admin password itself is
+   NEVER sent to the browser or used as an API key. */
+const adminSessions = new Map();
+setInterval(() => { const now = Date.now(); for (const [k, exp] of adminSessions) if (exp < now) adminSessions.delete(k); }, 30 * 60 * 1000).unref();
+
+/* The admin panel exists ONLY at the hidden /<ADMIN_PATH> route and is invisible to
+   crawlers. Common admin-discovery probes get a plain 404 — nothing to fingerprint. */
+if (ADMIN_PATH) {
+  app.get('/' + ADMIN_PATH, (req, res) => {
+    res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(__dirname, 'public', 'admin', 'index.html'));
+  });
+}
+app.all(['/admin', '/admin/*', '/admin.html', '/administrator', '/wp-admin', '/wp-login.php', '/backend', '/manage'], (req, res) => res.status(404).send('Not found'));
 
 /* ---------------------------------- auth ---------------------------------- */
 
@@ -54,7 +109,7 @@ function publicUser(u) {
 }
 
 function getSessionUser(req) {
-  const t = req.headers['x-auth-token'] || (req.query && req.query.token);
+  const t = req.headers['x-auth-token']; // header only — tokens in URLs leak via logs/history
   if (!t) return null;
   const data = db.load();
   const sess = data.sessions[t];
@@ -72,8 +127,10 @@ function requireAuth(req, res, next) {
 }
 
 function requireAdmin(req, res, next) {
-  const key = req.headers['x-admin-key'] || (req.query && req.query.key);
-  if (key !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Invalid admin credentials.' });
+  const key = req.headers['x-admin-key'] || '';
+  const exp = adminSessions.get(key);
+  if (!exp || exp < Date.now()) return res.status(401).json({ error: 'Invalid admin credentials.' });
+  adminSessions.set(key, Date.now() + 12 * 3600 * 1000); // sliding 12h session
   next();
 }
 
@@ -96,7 +153,7 @@ function notify(userId, text, kind) {
 
 /* ------------------------------ auth routes ------------------------------- */
 
-app.post('/api/register', (req, res) => {
+app.post('/api/register', rateLimit(10, 60 * 1000), (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'Name, email and password are required.' });
   if (String(password).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
@@ -129,7 +186,7 @@ app.post('/api/register', (req, res) => {
   res.json({ token: t, user: publicUser(u) });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', rateLimit(10, 60 * 1000), (req, res) => {
   const { email, password } = req.body || {};
   const data = db.load();
   const u = data.users.find(x => x.email === String(email || '').trim().toLowerCase());
@@ -150,7 +207,7 @@ app.post('/api/logout', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/forgot-password', (req, res) => {
+app.post('/api/forgot-password', rateLimit(5, 60 * 1000), (req, res) => {
   const { email } = req.body || {};
   const data = db.load();
   const u = data.users.find(x => x.email === String(email || '').trim().toLowerCase());
@@ -161,12 +218,16 @@ app.post('/api/forgot-password', (req, res) => {
     // No SMTP on free hosting: surface the reset link (demo). In production, email it.
     console.log(`[reset] link for ${u.email}: /reset.html?token=${t}`);
     db.save();
-    return res.json({ ok: true, message: 'If that email exists, a reset link has been created.', devResetToken: t });
+    const out = { ok: true, message: 'If that email exists, a reset link has been created.' };
+    // Dev-only helper (set ALLOW_DEV_RESET=true locally). NEVER enabled in production —
+    // otherwise anyone could reset any account straight from the API response.
+    if (process.env.ALLOW_DEV_RESET === 'true') out.devResetToken = t;
+    return res.json(out);
   }
   res.json({ ok: true, message: 'If that email exists, a reset link has been created.' });
 });
 
-app.post('/api/reset-password', (req, res) => {
+app.post('/api/reset-password', rateLimit(10, 60 * 1000), (req, res) => {
   const { token: tk, password } = req.body || {};
   const data = db.load();
   const rec = data.resetTokens[tk];
@@ -581,9 +642,15 @@ app.post('/api/notifications/read', requireAuth, (req, res) => {
 
 /* --------------------------------- admin ----------------------------------- */
 
-app.post('/api/admin/login', (req, res) => {
-  if ((req.body || {}).password !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Wrong password.' });
-  res.json({ ok: true, key: ADMIN_PASSWORD });
+app.post('/api/admin/login', rateLimit(5, 60 * 1000), (req, res) => {
+  if (!ADMIN_PASSWORD) return res.status(404).json({ error: 'Not found.' }); // admin disabled until ADMIN_PASSWORD is set
+  const pw = String((req.body || {}).password || '');
+  const a = Buffer.from(pw), b = Buffer.from(ADMIN_PASSWORD);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b); // timing-safe compare
+  if (!ok) return res.status(401).json({ error: 'Wrong password.' });
+  const key = token();
+  adminSessions.set(key, Date.now() + 12 * 3600 * 1000);
+  res.json({ ok: true, key }); // random session token — the real password never leaves the server
 });
 
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
@@ -700,6 +767,22 @@ app.post('/api/admin/deposits/:id', requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
+/* Admin: full M-Pesa / STK transaction ledger — pending, success, failed,
+   cancelled and timeout requests, with the M-Pesa receipt once confirmed. */
+app.get('/api/admin/payments', requireAdmin, (req, res) => {
+  const data = db.load();
+  const rows = (data.payments || []).slice(0, 200).map(p => {
+    const u = data.users.find(x => x.id === p.userId);
+    return {
+      id: p.id, user: u ? u.name : p.userId, email: u ? u.email : '',
+      amount: p.amount, phone: p.phone, purpose: p.purpose, packageKey: p.packageKey || '',
+      status: p.status, receipt: p.mpesaReceipt || '', reference: p.reference,
+      resultDesc: p.resultDesc || '', at: p.createdAt
+    };
+  });
+  res.json({ payments: rows });
+});
+
 /* ------------------------- KCB Buni M-Pesa STK push -------------------------- */
 
 const KCB = {
@@ -711,7 +794,7 @@ const KCB = {
   passKey: process.env.KCB_PASSKEY || '',                     // empty when using the shared short code
   till: process.env.KCB_TILL_NUMBER || process.env.KCB_SHORT_CODE || '522522',
   // NB: KCB's gateway validates the callback URL case-sensitively — keep the host lowercase.
-  baseUrl: (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://upworkkenyabackend.onrender.com').replace(/\/+$/, '').toLowerCase(),
+  baseUrl: (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '').toLowerCase(),
   callbackUrl: process.env.CALLBACK_URL || '',
   // Demo mode: when consumer key/secret are missing, STK-push endpoints simulate a
   // successful transaction locally so the flow (enter number → enter PIN → confirm →
@@ -741,7 +824,7 @@ async function kcbAccessToken() {
      - 'deposit'  (default) → credits amount to the earnings wallet
      - 'package'  + packageKey → unlocks that earning package for the user
      - 'verify'   → activates the Verified badge (fixed KES 450)                */
-app.post('/api/pay/kcb/stkpush', requireAuth, async (req, res) => {
+app.post('/api/pay/kcb/stkpush', requireAuth, rateLimit(12, 60 * 1000), async (req, res) => {
   try {
     const body = req.body || {};
     const purpose = ['deposit', 'package', 'verify'].indexOf(body.purpose) !== -1 ? body.purpose : 'deposit';
@@ -836,13 +919,20 @@ app.get('/api/pay/kcb/status/:id', requireAuth, (req, res) => {
   const data = db.load();
   const p = (data.payments || []).find(x => x.id === req.params.id && x.userId === req.user.id);
   if (!p) return res.status(404).json({ error: 'Payment not found.' });
+  // If the user entered their PIN but the gateway callback never arrived (network
+  // drop, cold start, case-mismatched callback URL), stop waiting after 2 minutes:
+  // mark the request 'timeout' so the frontend offers the M-Pesa confirmation-code
+  // fallback (payment completes instantly if the SMS arrived) or a clean retry.
+  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 120000) {
+    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 2 minutes. If you received the M-Pesa SMS, enter its confirmation code to finish.');
+  }
   res.json({ id: p.id, status: p.status, amount: p.amount, resultCode: p.resultCode, resultDesc: p.resultDesc, mpesaReceipt: p.mpesaReceipt, wallet: req.user.wallet });
 });
 
 /* Manual confirmation fallback: if the user already received the M-Pesa confirmation
    SMS from Safaricom/KCB but the gateway callback never arrived (site showed 'timeout'),
    they enter the receipt code from the SMS and the payment completes INSTANTLY. */
-app.post('/api/pay/kcb/confirm', requireAuth, (req, res) => {
+app.post('/api/pay/kcb/confirm', requireAuth, rateLimit(10, 60 * 1000), (req, res) => {
   const { paymentId, receipt } = req.body || {};
   const data = db.load();
   const p = (data.payments || []).find(x => x.id === String(paymentId || '') && x.userId === req.user.id);
@@ -938,8 +1028,8 @@ app.post('/api/pay/kcb/callback', (req, res) => {
    server and the Neon connection never sleep; also handy for uptime checks. */
 app.get('/api/health', async (req, res) => {
   let pg = false;
-  try { pg = await db.ping(); } catch {}
-  res.json({ ok: true, db: pg ? 'neon-postgres' : 'local-json', at: Date.now() });
+  try { pg = await db.ping(); } catch {} // keeps the DB connection warm; detail is not exposed
+  res.json({ ok: true, at: Date.now() });
 });
 
 /* --------------------------------- startup --------------------------------- */

@@ -8,13 +8,18 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.18.0
+      # --- Security: set all of these in the Render dashboard (never in code) ---
       - key: ADMIN_PASSWORD
         sync: false
       - key: SESSION_SECRET
         generateValue: true
-      # --- Neon Postgres (durable database) ---
+      - key: ADMIN_PATH
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      # --- Neon Postgres (durable database): set in the Render dashboard ---
       - key: DATABASE_URL
-        value: postgresql://neondb_owner:npg_gcuP3VCGA9rZ@ep-spring-art-a5l37hv9-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require
+        sync: false
       # --- KCB Buni M-Pesa STK push (set these in the Render dashboard) ---
       - key: KCB_CONSUMER_KEY
         sync: false
@@ -31,4 +36,4 @@ services:
       - key: KCB_PASSKEY
         value: ''
       - key: CALLBACK_URL
-        value: https://upworkkenyabackend.onrender.com/api/pay/kcb/callback
+        sync: false

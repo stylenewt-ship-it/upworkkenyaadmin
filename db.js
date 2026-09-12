@@ -21,10 +21,11 @@ const path = require('path');
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
-/* Neon Postgres connection. Can be overridden with the DATABASE_URL env var.
+/* Neon Postgres connection comes ONLY from the DATABASE_URL environment
+   variable — no credentials are stored anywhere in the code. Without it the
+   app simply runs on the local JSON store.
    NOTE: node-postgres cannot negotiate `channel_binding=require`, so that
    parameter is stripped — sslmode=require still keeps the wire encrypted. */
-const DEFAULT_DATABASE_URL = 'postgresql://neondb_owner:npg_gcuP3VCGA9rZ@ep-spring-art-a5l37hv9-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require';
 
 function cleanUrl(u) {
   return String(u || '')
@@ -106,6 +107,7 @@ let pgDirty = false;
 let pgTimer = null;
 let reconnectTimer = null;
 let initPromise = null;
+let firstSyncDone = false; // only the FIRST connect may pull state down from Neon
 
 async function persistPg() {
   if (!pgReady || !pgPool || pgWriting) { if (pgReady) pgDirty = true; return; }
@@ -151,7 +153,7 @@ async function init() {
   load(); // local cache available immediately
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    const url = cleanUrl(process.env.DATABASE_URL || DEFAULT_DATABASE_URL);
+    const url = cleanUrl(process.env.DATABASE_URL || '');
     if (!url) { console.log('[db] no DATABASE_URL — local JSON store only'); return; }
     try {
       if (pgPool) { try { await pgPool.end(); } catch {} pgPool = null; }
@@ -170,18 +172,22 @@ async function init() {
       )`);
       const r = await pgPool.query(`SELECT data FROM kv_store WHERE id = 'main'`);
       const remote = r.rows && r.rows[0] && r.rows[0].data;
-      if (remote && typeof remote === 'object' && Object.keys(remote).length) {
-        cache = ensureShape(remote);        // durable copy wins — sessions survive
+      if (remote && typeof remote === 'object' && Object.keys(remote).length && !firstSyncDone) {
+        cache = ensureShape(remote);        // durable copy wins on FIRST boot — restores users/sessions/admin data after restarts, redeploys or data loss
         saveLocalNow();                     // mirror to disk for fast boots
         console.log('[db] state restored from Neon Postgres (' + (cache.users || []).length + ' users, ' + Object.keys(cache.sessions || {}).length + ' live sessions)');
       } else {
+        // First-ever boot (Neon empty) OR a reconnect after a dropout: the local
+        // in-memory state is the NEWEST copy — push it UP so Neon is restored to
+        // the latest data instead of rolling the live app back to an older state.
         await pgPool.query(
           `INSERT INTO kv_store (id, data, updated_at) VALUES ('main', $1::jsonb, now())
-           ON CONFLICT (id) DO NOTHING`,
+           ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
           [JSON.stringify(cache)]
         );
-        console.log('[db] Neon Postgres seeded with the initial state');
+        console.log(firstSyncDone ? '[db] reconnected — latest state pushed back up to Neon' : '[db] Neon Postgres seeded with the initial state');
       }
+      firstSyncDone = true;
       pgReady = true;
       console.log('[db] connected to Neon Postgres — data is durable');
     } catch (e) {

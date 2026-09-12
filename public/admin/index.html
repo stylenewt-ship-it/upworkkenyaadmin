@@ -94,6 +94,7 @@
       <button class="nav-item" data-v="users">👥 Users</button>
       <button class="nav-item" data-v="withdrawals">💸 Withdrawals</button>
       <button class="nav-item" data-v="assignments">⚡ Task Submissions</button>
+      <button class="nav-item" data-v="payments">💳 M-Pesa Payments</button>
     </aside>
     <main class="main" id="main"></main>
   </div>
@@ -119,24 +120,29 @@ async function api(p, opts={}){
 
 $('gateForm').addEventListener('submit', async e => {
   e.preventDefault();
-  KEY = $('gatePw').value;
   try {
-    await api('/api/admin/stats');
+    // Exchange the password for a short-lived server-side session token.
+    // The password itself is never stored in the browser or used as an API key.
+    const r = await fetch('/api/admin/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: $('gatePw').value }) });
+    const d = await r.json().catch(()=>({}));
+    if (!r.ok || !d.key) throw new Error(d.error || 'Login failed');
+    KEY = d.key;
     sessionStorage.setItem('uk_admin_key', KEY);
+    $('gatePw').value = '';
     enter();
-  } catch { $('gateErr').style.display='block'; KEY=''; }
+  } catch { $('gateErr').style.display='block'; KEY=''; sessionStorage.removeItem('uk_admin_key'); }
 });
 
 function enter(){ $('gate').style.display='none'; $('shell').style.display='block'; loadAll(); }
 function logout(){ sessionStorage.removeItem('uk_admin_key'); location.reload(); }
-if (KEY) { api('/api/admin/stats').then(enter).catch(()=>{ KEY=''; }); }
+if (KEY) { api('/api/admin/stats').then(enter).catch(()=>{ KEY=''; sessionStorage.removeItem('uk_admin_key'); }); }
 
 document.querySelectorAll('.nav-item').forEach(b => b.onclick = () => {
   document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));
   b.classList.add('active'); loadView(b.dataset.v);
 });
 function loadAll(){ loadView(document.querySelector('.nav-item.active').dataset.v); }
-function loadView(v){ ({overview:viewOverview,users:viewUsers,withdrawals:viewWd,assignments:viewAsg})[v](); }
+function loadView(v){ ({overview:viewOverview,users:viewUsers,withdrawals:viewWd,assignments:viewAsg,payments:viewPays})[v](); }
 
 async function viewOverview(){
   const s = await api('/api/admin/stats');
@@ -226,6 +232,36 @@ async function viewAsg(){
       : '<p style="color:var(--muted);padding:14px">No submissions yet.</p>'}
     </div>`;
 }
+async function viewPays(){
+  const r = await api('/api/admin/payments');
+  const cls = s => s==='success'?'p-green':s==='failed'?'p-red':s==='cancelled'?'p-red':'p-amber';
+  $('main').innerHTML = `
+    <div class="h1">M-Pesa / STK transactions</div>
+    <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Every STK push: <b>pending</b> (PIN prompt sent) → <b>success</b> (confirmed, receipt shown) · <b>failed</b> / <b>cancelled</b> / <b>timeout</b>. Timeout means the callback never arrived — the user can still complete with the SMS code.</p>
+    <div class="card" style="padding:6px 12px;overflow-x:auto">
+      ${r.payments.length ? `<table><thead><tr><th>User</th><th>Purpose</th><th>Amount</th><th>Phone</th><th>Status</th><th>M-Pesa receipt</th><th>Ref</th><th>When</th></tr></thead>
+      <tbody>${r.payments.map(p=>`
+        <tr><td><b>${esc(p.user)}</b><div style="font-size:11px;color:var(--muted)">${esc(p.email)}</div></td>
+        <td><span class="pill p-blue">${esc(p.purpose)}${p.packageKey?' · '+esc(p.packageKey):''}</span></td>
+        <td><b>${money(p.amount)}</b></td><td>${esc(p.phone)}</td>
+        <td><span class="pill ${cls(p.status)}">${esc(p.status)}</span></td>
+        <td style="font-weight:700">${esc(p.receipt||'—')}</td>
+        <td style="font-size:12px;color:var(--muted)">${esc(p.reference)}</td><td>${ago(p.at)}</td></tr>`).join('')}</tbody></table>`
+      : '<p style="color:var(--muted);padding:14px">No M-Pesa transactions yet.</p>'}
+    </div>`;
+}
+
+/* Anti-inspection deterrent: blocks right-click and common DevTools shortcuts. */
+(function antiInspect(){
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('keydown', e => {
+    const k = (e.key || '').toLowerCase();
+    if (e.key === 'F12' || (e.ctrlKey && e.shiftKey && ['i','j','c'].indexOf(k) !== -1) || (e.ctrlKey && ['u','s'].indexOf(k) !== -1)) {
+      e.preventDefault(); e.stopPropagation();
+    }
+  }, true);
+})();
+
 /* Keep the free-tier backend (and the Neon database connection) awake while the admin panel is open. */
 setInterval(function(){ fetch('/api/health').catch(function(){}); }, 10 * 60 * 1000);
 fetch('/api/health').catch(function(){});
