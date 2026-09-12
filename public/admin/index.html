@@ -91,6 +91,7 @@
   <div class="layout">
     <aside class="sidebar">
       <button class="nav-item active" data-v="overview">📊 Overview</button>
+      <button class="nav-item" data-v="wallet">🏦 Platform Wallet</button>
       <button class="nav-item" data-v="users">👥 Users</button>
       <button class="nav-item" data-v="withdrawals">💸 Withdrawals</button>
       <button class="nav-item" data-v="assignments">⚡ Task Submissions</button>
@@ -146,7 +147,7 @@ document.querySelectorAll('.nav-item').forEach(b => b.onclick = () => {
   b.classList.add('active'); loadView(b.dataset.v);
 });
 function loadAll(){ loadView(document.querySelector('.nav-item.active').dataset.v); }
-function loadView(v){ ({overview:viewOverview,users:viewUsers,withdrawals:viewWd,assignments:viewAsg,payments:viewPays})[v](); }
+function loadView(v){ ({overview:viewOverview,wallet:viewWallet,users:viewUsers,withdrawals:viewWd,assignments:viewAsg,payments:viewPays})[v](); }
 
 async function viewOverview(){
   const s = await api('/api/admin/stats');
@@ -178,15 +179,18 @@ async function viewUsers(){
         <tr>
           <td><b>${esc(u.name)}</b></td><td>${esc(u.email)}</td>
           <td><b>${money(u.wallet)}</b></td>
-          <td><span class="pill p-blue">${u.tier}</span></td>
+          <td><span class="pill p-blue">${u.tier||'—'}</span><div style="font-size:11px;color:var(--muted)">${(u.unlockedPackages||[]).map(esc).join(', ')||'no paid packages'}</div></td>
           <td>${u.testPassed?'<span class="pill p-green">passed</span>':'<span class="pill p-amber">pending</span>'}</td>
           <td>${u.verified?'<span style="color:#1d9bf0;font-weight:800">✓</span>':'—'}</td>
-          <td>${u.suspended?'<span class="pill p-red">suspended</span>':'<span class="pill p-green">active</span>'}</td>
+          <td>${u.suspended?'<span class="pill p-red">suspended</span>':'<span class="pill p-green">active</span>'}${u.withdrawSuspendedUntil&&u.withdrawSuspendedUntil>Date.now()?'<div style="font-size:11px;color:#fcd34d">wd held</div>':''}</td>
           <td style="white-space:nowrap">
             <select onchange="setTier('${u.id}',this.value)" style="width:auto;padding:6px 8px;display:inline-block">
               <option value="">Tier…</option><option value="basic">Basic</option><option value="premium">Premium</option><option value="advanced">Advanced</option><option value="pro">Pro</option><option value="advancedPro">Advanced Pro</option>
             </select>
             <button class="btn btn-ghost btn-sm" onclick="adjust('${u.id}')">± KES</button>
+            <button class="btn btn-ghost btn-sm" onclick="closePkg('${u.id}')">Close pkg</button>
+            <button class="btn btn-ghost btn-sm" onclick="wdSuspend('${u.id}')">WD hold</button>
+            <button class="btn btn-ghost btn-sm" onclick="announce('${u.id}')">📢</button>
             <button class="btn ${u.suspended?'btn-primary':'btn-danger'} btn-sm" onclick="suspend('${u.id}',${!u.suspended})">${u.suspended?'Unsuspend':'Suspend'}</button>
           </td>
         </tr>`).join('')}</tbody></table>
@@ -199,6 +203,27 @@ async function adjust(id){
   const note = prompt('Reason / note:') || 'Admin adjustment';
   try{ await api(`/api/admin/users/${id}/adjust`,{method:'POST',body:JSON.stringify({amount:Number(amt),note})}); toast('Wallet adjusted'); viewUsers(); }catch(e){ toast(e.message);}
 }
+/* Close a member's package (e.g. abuse, chargeback). Wallet & history stay intact. */
+async function closePkg(id){
+  const raw = prompt('Package to CLOSE (basic / premium / advanced / pro / advancedPro). Leave empty to close the ACTIVE package:');
+  if (raw === null) return;
+  try{ await api(`/api/admin/users/${id}/package/close`,{method:'POST',body:JSON.stringify({key:String(raw).trim()})}); toast('Package closed'); viewUsers(); }catch(e){ toast(e.message);}
+}
+/* Hold a member's withdrawals until a date — they see the reason on their profile. */
+async function wdSuspend(id){
+  const days = prompt('Hold withdrawals for how many DAYS? (0 = lift the hold)'); if(days===null) return;
+  const d = Number(days);
+  let until = 0, reason = '';
+  if (d > 0) { until = Date.now() + d*86400000; reason = prompt('Reason shown to the user (e.g. payout verification in progress):') || ''; }
+  try{ await api(`/api/admin/users/${id}/withdraw-suspend`,{method:'POST',body:JSON.stringify({until,reason})}); toast(d>0?'Withdrawals held':'Withdrawal hold lifted'); viewUsers(); }catch(e){ toast(e.message);}
+}
+/* Announcement pinned on the member's profile (e.g. why their pending money is held). */
+async function announce(id){
+  const title = prompt('Announcement title (e.g. Your withdrawal is on hold):') || 'Notice from Upwork Kenya';
+  const message = prompt('Message (tell the user the reason — it appears on their profile):');
+  if(!message) return;
+  try{ await api(`/api/admin/users/${id}/announce`,{method:'POST',body:JSON.stringify({title,message})}); toast('Announcement posted'); }catch(e){ toast(e.message);}
+}
 
 async function viewWd(){
   const r = await api('/api/admin/withdrawals');
@@ -206,36 +231,93 @@ async function viewWd(){
   const lbl = s => s==='paid'?'cleared':s;
   $('main').innerHTML = `
     <div class="h1">Withdrawal requests</div>
-    <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Flow: <b>pending</b> → <b>Approve</b> it → send the money from your phone (M-Pesa) → <b>Mark cleared</b>. Rejecting refunds the user's wallet.</p>
+    <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Flow: <b>pending</b> → pay what you have on hand with <b>💸 Pay part</b> (the user sees e.g. "KES 2,000 verified · KES 3,000 pending") → pay the rest later with <b>Pay part</b> again until fully cleared. <b>Approve</b> marks it approved without paying yet; <b>Reject</b> refunds the wallet.</p>
     <div class="card" style="padding:6px 12px;overflow-x:auto">
-      ${r.withdrawals.length ? `<table><thead><tr><th>User</th><th>Amount</th><th>M-Pesa</th><th>Status</th><th>Requested</th><th>Actions</th></tr></thead>
-      <tbody>${r.withdrawals.map(w=>`
-        <tr><td>${esc(w.userId)}</td><td><b>${money(w.amount)}</b></td><td>${esc(w.phone)}</td>
+      ${r.withdrawals.length ? `<table><thead><tr><th>User</th><th>Amount</th><th>Verified / Pending</th><th>M-Pesa</th><th>Status</th><th>Requested</th><th>Actions</th></tr></thead>
+      <tbody>${r.withdrawals.map(w=>{
+        const paid=w.paidAmount||0, left=Math.max(0,w.amount-paid);
+        return `<tr><td><b style="color:#2dd4bf">${esc(w.userName||w.userId)}</b><div style="font-size:11px;color:var(--muted)">${esc(w.userEmail||'')}</div></td><td><b>${money(w.amount)}</b></td>
+        <td>${paid>0?`<span style="color:#86efac;font-weight:700">${money(paid)} verified</span><br><span style="color:#fcd34d">${money(left)} pending</span>`:'—'}</td>
+        <td>${esc(w.phone)}</td>
         <td><span class="pill ${pillCls(w.status)}">${lbl(w.status)}</span></td>
         <td>${ago(w.at)}</td>
         <td style="white-space:nowrap">${w.status==='pending'
-          ? `<button class="btn btn-primary btn-sm" onclick="wd('${w.id}','approved')">Approve</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
+          ? `<button class="btn btn-primary btn-sm" onclick="wdPart('${w.id}')">💸 Pay part</button> <button class="btn btn-primary btn-sm" onclick="wd('${w.id}','approved')">Approve</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
           : w.status==='approved'
-            ? `<button class="btn btn-primary btn-sm" onclick="wd('${w.id}','cleared')">✓ Mark cleared (money sent)</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
-            : '—'}</td></tr>`).join('')}</tbody></table>`
+            ? `<button class="btn btn-primary btn-sm" onclick="wdPart('${w.id}')">💸 Pay part / rest</button> <button class="btn btn-primary btn-sm" onclick="wd('${w.id}','cleared')">✓ Mark cleared</button> <button class="btn btn-danger btn-sm" onclick="wd('${w.id}','rejected')">Reject</button>`
+            : '—'}</td></tr>`;
+      }).join('')}</tbody></table>`
       : '<p style="color:var(--muted);padding:14px">No withdrawal requests yet.</p>'}
     </div>`;
 }
 async function wd(id, status){ try{ await api(`/api/admin/withdrawals/${id}`,{method:'POST',body:JSON.stringify({status})}); toast('Updated'); viewWd(); }catch(e){ toast(e.message);} }
+/* Pay part (or all) of a withdrawal with the funds on hand; the remainder stays pending and can be verified later. */
+async function wdPart(id){
+  const amt = prompt('How much are you paying NOW (KES)? The rest of the request stays pending.'); if(!amt) return;
+  const note = prompt('Note (optional):') || '';
+  try{ await api(`/api/admin/withdrawals/${id}`,{method:'POST',body:JSON.stringify({status:'partial',amount:Number(amt),note})}); toast('Payout recorded — the user sees verified vs pending'); viewWd(); }catch(e){ toast(e.message);}
+}
 
 async function viewAsg(){
   const r = await api('/api/admin/assignments');
+  const cls = s => s==='approved'?'p-green':s==='rejected'?'p-red':'p-amber';
   $('main').innerHTML = `
-    <div class="h1">Recent task submissions</div>
+    <div class="h1">Task submissions — verification queue</div>
+    <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Every uploaded file is <b>scanned</b> automatically (type + signature + content). Open the file, check the work against the brief, then <b>Approve</b> (earnings are released to the user) or <b>Reject</b> with a reason (the user can re-submit).</p>
     <div class="card" style="padding:6px 12px;overflow-x:auto">
-      ${r.assignments.length ? `<table><thead><tr><th>User</th><th>Task</th><th>Category</th><th>Gross</th><th>Fee</th><th>Net paid</th><th>Submission</th><th>When</th></tr></thead>
+      ${r.assignments.length ? `<table><thead><tr><th>User</th><th>Task</th><th>Category</th><th>Gross</th><th>Fee</th><th>Net</th><th>File</th><th>Status</th><th>Note</th><th>When</th><th>Actions</th></tr></thead>
       <tbody>${r.assignments.map(a=>`
-        <tr><td>${esc(a.userId)}</td><td>${esc(a.title)}</td><td><span class="pill p-blue">${esc(a.category)}</span></td>
+        <tr><td><b style="color:#2dd4bf">${esc(a.userName||a.userId)}</b></td><td>${esc(a.title)}</td><td><span class="pill p-blue">${esc(a.category)}</span></td>
         <td>${money(a.gross)}</td><td>${money(a.fee)}</td><td><b>${money(a.net)}</b></td>
-        <td style="max-width:220px;font-size:12px;color:var(--muted)">${esc(a.submission).slice(0,120)}</td><td>${ago(a.at)}</td></tr>`).join('')}</tbody></table>`
+        <td>${a.fileData?`<a href="/api/admin/assignments/${a.id}/file" onclick="return openFile(event,this)" style="color:#93c5fd">📎 ${esc(a.fileName||'file')}</a><div style="font-size:11px;color:var(--muted)">${esc(a.fileKind||'')} · ${Math.round((a.fileSize||0)/1024)} KB${a.scan&&a.scan.warnings&&a.scan.warnings.length?'<br><span style="color:#fcd34d">⚠ '+esc(a.scan.warnings.join('; '))+'</span>':'<br><span style="color:#86efac">scan passed</span>'}</div>`:'<span style="color:var(--muted)">legacy</span>'}</td>
+        <td><span class="pill ${cls(a.status||'pending')}">${esc(a.status||'pending')}</span></td>
+        <td style="max-width:180px;font-size:12px;color:var(--muted)">${esc(a.submission||'').slice(0,120)}${a.reviewNote?'<br><span style="color:#fca5a5">'+esc(a.reviewNote)+'</span>':''}</td><td>${ago(a.at)}</td>
+        <td style="white-space:nowrap">${a.status==='pending'
+          ? `<button class="btn btn-primary btn-sm" onclick="asg('${a.id}','approved')">✓ Approve &amp; pay</button> <button class="btn btn-danger btn-sm" onclick="asgReject('${a.id}')">Reject</button>`
+          : '—'}</td></tr>`).join('')}</tbody></table>`
       : '<p style="color:var(--muted);padding:14px">No submissions yet.</p>'}
     </div>`;
 }
+async function asg(id, status){ try{ await api(`/api/admin/assignments/${id}`,{method:'POST',body:JSON.stringify({status})}); toast(status==='approved'?'Approved — earnings released':'Updated'); viewAsg(); }catch(e){ toast(e.message);} }
+async function asgReject(id){ const note = prompt('Reason (the user sees this and can re-submit):') || 'Does not meet the brief'; try{ await api(`/api/admin/assignments/${id}`,{method:'POST',body:JSON.stringify({status:'rejected',note})}); toast('Rejected'); viewAsg(); }catch(e){ toast(e.message);} }
+/* File downloads need the admin header — fetch with the key, then open the blob. */
+async function openFile(e, a){ e.preventDefault(); try{ const r = await fetch(a.href,{headers:{'x-admin-key':KEY}}); const b = await r.blob(); window.open(URL.createObjectURL(b),'_blank'); }catch{ toast('Could not open the file'); } return false; }
+/* Admin completes a stuck/interfered payment with the real M-Pesa code once
+   the M-Pesa & bank messages prove the money arrived. Cancelled payments are
+   refused by the server — the user must try again. */
+async function completePay(id){
+  const code = prompt('Enter the 10-character M-Pesa confirmation code from the M-Pesa/bank message (e.g. QGH1ABC2XY):');
+  if(!code) return;
+  try{ await api(`/api/admin/payments/${id}/complete`,{method:'POST',body:JSON.stringify({receipt:code})}); toast('✅ Transaction completed'); viewPays(); }catch(e){ toast(e.message);}
+}
+
+/* PLATFORM WALLET — every shilling received by the backend, totalled. */
+async function viewWallet(){
+  const r = await api('/api/admin/wallet');
+  $('main').innerHTML = `
+    <div class="h1">Platform wallet 🏦</div>
+    <div class="grid grid-4">
+      <div class="card stat"><div class="num" style="color:var(--primary)">${money(r.totalReceived)}</div><div class="lbl">Total received (all time)</div></div>
+      <div class="card stat"><div class="num">${money(r.packageRevenue)}</div><div class="lbl">Package unlocks</div></div>
+      <div class="card stat"><div class="num">${money(r.verificationRevenue)}</div><div class="lbl">Verification fees</div></div>
+      <div class="card stat warn"><div class="num">${money(r.depositVolume + (r.manualDepositVolume||0))}</div><div class="lbl">Wallet deposits</div></div>
+      <div class="card stat bad"><div class="num">${money(r.totalPaidOut)}</div><div class="lbl">Paid out to users (${r.payoutCount||0})</div></div>
+      <div class="card stat"><div class="num" style="color:#2dd4bf">${money(r.walletBalance)}</div><div class="lbl">Wallet balance (received − payouts)</div></div>
+    </div>
+    <div class="card" style="margin-top:16px;padding:6px 12px;overflow-x:auto">
+      <h3 style="padding:14px 10px 4px">Receipts ledger (${r.paymentsCount} successful payments${r.pendingCount?`, ${r.pendingCount} pending`:''})</h3>
+      ${r.ledger.length ? `<table><thead><tr><th>User</th><th>Purpose</th><th>Amount</th><th>M-Pesa receipt</th><th>Ref</th><th>When</th></tr></thead>
+      <tbody>${r.ledger.map(p=>`<tr><td><b>${esc(p.user)}</b></td><td><span class="pill p-blue">${esc(p.purpose)}${p.packageKey?' · '+esc(p.packageKey):''}</span></td><td><b>${money(p.amount)}</b></td><td style="font-weight:700">${esc(p.receipt||'—')}</td><td style="font-size:12px;color:var(--muted)">${esc(p.reference)}</td><td>${ago(p.at)}</td></tr>`).join('')}</tbody></table>`
+      : '<p style="color:var(--muted);padding:14px">No payments received yet.</p>'}
+    </div>
+    <div class="card" style="margin-top:16px;padding:6px 12px;overflow-x:auto">
+      <h3 style="padding:14px 10px 4px">Payouts — money sent to users (${r.payoutCount||0})</h3>
+      ${(r.payouts||[]).length ? `<table><thead><tr><th>User</th><th>M-Pesa</th><th>Paid</th><th>Requested</th><th>When</th></tr></thead>
+      <tbody>${r.payouts.map(p=>`<tr><td><b style="color:#2dd4bf">${esc(p.user)}</b></td><td>${esc(p.phone||'')}</td><td><b>${money(p.amount)}</b></td><td style="color:var(--muted)">${money(p.requested)}</td><td>${ago(p.at)}</td></tr>`).join('')}</tbody></table>`
+      : '<p style="color:var(--muted);padding:14px">No payouts sent yet.</p>'}
+    </div>`;
+}
+
 async function viewPays(){
   const r = await api('/api/admin/payments');
   const cls = s => s==='success'?'p-green':s==='failed'?'p-red':s==='cancelled'?'p-red':'p-amber';
@@ -243,14 +325,15 @@ async function viewPays(){
     <div class="h1">M-Pesa / STK transactions</div>
     <p style="color:var(--muted);font-size:13px;margin:-8px 0 14px">Every STK push: <b>pending</b> (PIN prompt sent) → <b>success</b> (confirmed, receipt shown) · <b>failed</b> / <b>cancelled</b> / <b>timeout</b>. Timeout means the callback never arrived — the user can still complete with the SMS code.</p>
     <div class="card" style="padding:6px 12px;overflow-x:auto">
-      ${r.payments.length ? `<table><thead><tr><th>User</th><th>Purpose</th><th>Amount</th><th>Phone</th><th>Status</th><th>M-Pesa receipt</th><th>Ref</th><th>When</th></tr></thead>
+      ${r.payments.length ? `<table><thead><tr><th>User</th><th>Purpose</th><th>Amount</th><th>Phone</th><th>Status</th><th>M-Pesa receipt</th><th>Ref</th><th>When</th><th>Actions</th></tr></thead>
       <tbody>${r.payments.map(p=>`
         <tr><td><b>${esc(p.user)}</b><div style="font-size:11px;color:var(--muted)">${esc(p.email)}</div></td>
         <td><span class="pill p-blue">${esc(p.purpose)}${p.packageKey?' · '+esc(p.packageKey):''}</span></td>
         <td><b>${money(p.amount)}</b></td><td>${esc(p.phone)}</td>
         <td><span class="pill ${cls(p.status)}">${esc(p.status)}</span>${p.manualReview?' <span class="pill p-amber" title="Completed with a user-entered SMS code while the gateway status was unavailable — verify against your M-Pesa statement">check</span>':''}</td>
         <td style="font-weight:700">${esc(p.receipt||'—')}</td>
-        <td style="font-size:12px;color:var(--muted)">${esc(p.reference)}</td><td>${ago(p.at)}</td></tr>`).join('')}</tbody></table>`
+        <td style="font-size:12px;color:var(--muted)">${esc(p.reference)}</td><td>${ago(p.at)}</td>
+        <td>${['pending','timeout','failed'].indexOf(p.status)!==-1?`<button class="btn btn-primary btn-sm" onclick="completePay('${p.id}')">✓ Complete w/ code</button>`:''}</td></tr>`).join('')}</tbody></table>`
       : '<p style="color:var(--muted);padding:14px">No M-Pesa transactions yet.</p>'}
     </div>`;
 }

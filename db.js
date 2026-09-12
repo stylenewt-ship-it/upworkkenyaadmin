@@ -55,7 +55,8 @@ function seedData() {
     settings: {
       platformFeePct: 10,
       verificationFee: 450,
-      minWithdrawal: 100
+      minWithdrawal: 100,
+      withdrawalHoldDays: 7   // one withdrawal every 7 days; first withdrawal opens 7 days after joining
     }
   };
 }

@@ -31,8 +31,8 @@ const ADMIN_PATH = String(process.env.ADMIN_PATH || '').replace(/^\/+|\/+$/g, ''
    header) always work. Every other cross-origin call is rejected by the browser. */
 const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-/* 10mb: profile photos uploaded from the device travel as base64 data URLs. */
-app.use(express.json({ limit: '10mb' }));
+/* 15mb: profile photos AND task deliverable files (PDF/Word/Excel) travel as base64 data URLs. */
+app.use(express.json({ limit: '15mb' }));
 
 /* Security headers on every response. */
 app.use((req, res, next) => {
@@ -260,7 +260,11 @@ app.post('/api/reset-password', rateLimit(10, 60 * 1000), (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireAuth, (req, res) => res.json({ user: publicUser(req.user) }));
+app.get('/api/me', requireAuth, (req, res) => {
+  const data = db.load();
+  const announcements = (data.announcements || []).filter(a => a.userId === req.user.id).slice(0, 10);
+  res.json({ user: publicUser(req.user), announcements });
+});
 
 /* -------------------------------- profile --------------------------------- */
 
@@ -366,6 +370,13 @@ function highestUnlockedTier(u) {
   return best;
 }
 
+/* INVARIANT — no free package can ever slip through by mistake: a user may
+   only RECEIVE or SUBMIT daily tasks when their active tier is one they have
+   actually PAID to unlock. Every task route runs this check. */
+function userCanDoTasks(u) {
+  return !!(u.tier && PACKAGES[u.tier] && hasUnlockedPackage(u, u.tier));
+}
+
 function lifetimeEarned(data, userId) {
   const fromTasks = data.assignments.filter(a => a.userId === userId).reduce((s, a) => s + (a.gross || a.net || 0), 0);
   const fromOrders = data.orders.filter(o => o.sellerId === userId && o.status === 'completed').reduce((s, o) => s + o.price, 0);
@@ -387,7 +398,7 @@ function checkTierUpgrade(u /*, data */) {
 app.get('/api/tasks/today', requireAuth, (req, res) => {
   const u = req.user;
   if (!u.testPassed) return res.status(403).json({ error: 'Pass the typing test first to unlock daily tasks.', needsTest: true });
-  if (!u.tier || !PACKAGES[u.tier]) {
+  if (!userCanDoTasks(u)) {
     return res.status(403).json({ error: 'Unlock a package first to receive your daily tasks.', needsPackage: true });
   }
   const data = db.load();
@@ -403,29 +414,105 @@ app.post('/api/tasks/submit', requireAuth, (req, res) => {
   const { taskKey, submission } = req.body || {};
   const u = req.user;
   if (!u.testPassed) return res.status(403).json({ error: 'Pass the typing test first.' });
-  if (!u.tier || !PACKAGES[u.tier]) return res.status(403).json({ error: 'Unlock a package first to submit tasks.', needsPackage: true });
+  if (!userCanDoTasks(u)) return res.status(403).json({ error: 'Unlock a package first to submit tasks.', needsPackage: true });
   const data = db.load();
   const today = new Date().toISOString().slice(0, 10);
   const [day] = String(taskKey || '').split(':');
   if (day !== today) return res.status(400).json({ error: 'That task has expired. New tasks arrive daily.' });
-  if (data.assignments.some(a => a.userId === u.id && a.taskKey === taskKey)) {
+  if (data.assignments.some(a => a.userId === u.id && a.taskKey === taskKey && a.status !== 'rejected')) {
     return res.status(409).json({ error: 'You already submitted this task today.' });
   }
-  if (!submission || String(submission).trim().length < 20) {
-    return res.status(400).json({ error: 'Your submission is too short — add a note or link to your delivered work (min 20 characters).' });
-  }
-  const tasks = dailyTasksFor(u.id, 16, payForTierFactory(u));
+  if (submission && String(submission).trim()) u.lastSubmissionNote = String(submission).slice(0, 1000);
+  const tasks = dailyTasksFor(u.id, 24, payForTierFactory(u));
   const task = tasks.find(x => x.key === taskKey);
   if (!task) return res.status(404).json({ error: 'Task not found.' });
-  // Auto-approve at demo scale; flag for admin review too.
-  const fee = Math.round(task.pay * (db.load().settings.platformFeePct / 100));
+  /* The work is done OFF the site and must be delivered as a FILE UPLOAD —
+     submissions open for admin review; earnings are released on approval. */
+  res.status(400).json({ error: 'Upload your completed file to submit this task.', needsFile: true, deliverable: task.deliverable || 'pdf' });
+});
+
+/* Scan an uploaded deliverable file: correct TYPE for the task (PDF / Word /
+   Excel only — enforced by extension AND binary signature), real content
+   (minimum size) and zero executable content. */
+function scanUploadDataUrl(dataUrl) {
+  const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(dataUrl || ''));
+  if (!m || !m[2]) return { ok: false, error: 'Upload must be a file (PDF, Word or Excel).' };
+  const mime = String(m[1] || '').toLowerCase();
+  let buf;
+  try { buf = Buffer.from(m[3], 'base64'); } catch { return { ok: false, error: 'The file could not be read. Re-export it and try again.' }; }
+  if (!buf.length) return { ok: false, error: 'The uploaded file is empty.' };
+  if (buf.length > 6 * 1024 * 1024) return { ok: false, error: 'File too large — maximum 6 MB.' };
+  const isPdf = mime === 'application/pdf';
+  const isWord = ['application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'].includes(mime);
+  const isExcel = ['application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'].includes(mime);
+  if (!isPdf && !isWord && !isExcel) return { ok: false, error: 'Only PDF, Word (.doc/.docx) or Excel (.xls/.xlsx) files are accepted.' };
+  // Magic-byte verification — a renamed file can never pass as another format.
+  const head4 = buf.slice(0, 4).toString('latin1');
+  if (isPdf && head4 !== '%PDF') return { ok: false, error: 'That file is not a valid PDF (signature check failed).' };
+  const isZip = head4 === 'PK\u0003\u0004';
+  const isOle = buf.slice(0, 8).equals(Buffer.from([0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]));
+  if ((isWord || isExcel) && !isZip && !isOle) return { ok: false, error: 'That file is not a valid Office document (signature check failed).' };
+  if (isZip) {
+    // DOCX must be a Word package, XLSX must be an Excel package.
+    const probe = buf.slice(0, 4 * 1024 * 1024).toString('latin1');
+    if (isWord && probe.indexOf('word/') === -1) return { ok: false, error: 'That .docx does not contain a Word document.' };
+    if (isExcel && probe.indexOf('xl/') === -1) return { ok: false, error: 'That .xlsx does not contain an Excel spreadsheet.' };
+  }
+  // Executable content can never be a deliverable.
+  if (buf.slice(0, 2).toString('latin1') === 'MZ') return { ok: false, error: 'Executable files are not accepted.' };
+  const kind = isPdf ? 'pdf' : isWord ? 'word' : 'excel';
+  if (buf.length < 400) return { ok: false, kind, size: buf.length, error: 'The file looks empty or corrupted — export the finished document and upload again.' };
+  const warnings = [];
+  if (buf.length < 3000) warnings.push('Very small file — please double-check the document is complete.');
+  return { ok: true, kind, size: buf.length, warnings };
+}
+
+const DELIVERABLE_LABELS = { pdf: 'a PDF file', word: 'a Word document (.doc / .docx)', excel: 'an Excel spreadsheet (.xls / .xlsx)' };
+
+/* Submit a completed task as a FILE UPLOAD. The work is done off the site
+   (design the poster, write the report, enter the data…), converted to the
+   format the task requires (poster → PDF, data entry → Excel, essay → Word),
+   then uploaded here. The file is SCANNED instantly; if it passes, it goes to
+   VERIFICATION by the admin team and earnings are released on approval. */
+app.post('/api/tasks/submit-file', requireAuth, rateLimit(30, 60 * 1000), (req, res) => {
+  const { taskKey, submission, fileName, fileData } = req.body || {};
+  const u = req.user;
+  if (!u.testPassed) return res.status(403).json({ error: 'Pass the typing test first.' });
+  if (!userCanDoTasks(u)) return res.status(403).json({ error: 'Unlock a package first to submit tasks.', needsPackage: true });
+  const data = db.load();
+  const today = new Date().toISOString().slice(0, 10);
+  const [day] = String(taskKey || '').split(':');
+  if (day !== today) return res.status(400).json({ error: 'That task has expired. New tasks arrive daily.' });
+  if (data.assignments.some(a => a.userId === u.id && a.taskKey === taskKey && a.status !== 'rejected')) {
+    return res.status(409).json({ error: 'You already submitted this task today.' });
+  }
+  const tasks = dailyTasksFor(u.id, 24, payForTierFactory(u));
+  const task = tasks.find(x => x.key === taskKey);
+  if (!task) return res.status(404).json({ error: 'Task not found.' });
+  if (!fileData) return res.status(400).json({ error: 'Attach your completed file (' + (DELIVERABLE_LABELS[task.deliverable] || 'a PDF, Word or Excel file') + ').' });
+
+  const scan = scanUploadDataUrl(fileData);
+  if (!scan.ok) return res.status(400).json({ error: 'Scan failed: ' + scan.error });
+  if (scan.kind !== task.deliverable) {
+    return res.status(400).json({ error: 'This task requires ' + (DELIVERABLE_LABELS[task.deliverable] || 'a different file type') + ' — you uploaded a ' + scan.kind.toUpperCase() + ' file. Convert your work to the required format and upload again.' });
+  }
+
+  const fee = Math.round(task.pay * (data.settings.platformFeePct / 100));
   const net = task.pay - fee;
-  data.assignments.unshift({ id: db.uid('asg'), userId: u.id, taskKey, day: today, title: task.title, category: task.category, gross: task.pay, fee, net, status: 'approved', submission: String(submission).slice(0, 2000), at: Date.now() });
-  addTx(u.id, 'earning', net, `Task: ${task.title} (gross KES ${task.pay}, platform fee KES ${fee})`);
-  notify(u.id, `Task approved — KES ${net} added to your wallet.`, 'success');
-  checkTierUpgrade(u, db.load());
+  const fname = String(fileName || 'delivery').slice(0, 120);
+  data.assignments.unshift({
+    id: db.uid('asg'), userId: u.id, taskKey, day: today,
+    title: task.title, category: task.category, deliverable: task.deliverable,
+    gross: task.pay, fee, net,
+    status: 'pending', // scanned OK — now awaiting admin verification before payment
+    submission: String(submission || '').slice(0, 1000),
+    fileName: fname, fileData: String(fileData).slice(0, 9000000), fileSize: scan.size, fileKind: scan.kind,
+    scan: { at: Date.now(), warnings: scan.warnings || [] },
+    at: Date.now()
+  });
+  notify(u.id, `✅ File received & scanned — "${task.title}" (${fname}) is now in verification. KES ${net} will be credited the moment it is approved.`, 'info');
   db.saveNow();
-  res.json({ ok: true, earned: net, wallet: u.wallet });
+  res.json({ ok: true, status: 'pending', message: 'File scanned successfully and sent for verification.', scan });
 });
 
 app.get('/api/earnings', requireAuth, (req, res) => {
@@ -557,6 +644,22 @@ app.post('/api/wallet/withdraw', requireAuth, (req, res) => {
   const data = db.load();
   const u = req.user;
   const min = data.settings.minWithdrawal;
+  const holdMs = (data.settings.withdrawalHoldDays || 7) * 86400000;
+  // The admin can suspend a member's withdrawals — the member sees the reason as an announcement on their profile.
+  // (Checked first so a suspended member always sees the real reason, not the generic 7-day message.)
+  if (u.withdrawSuspendedUntil && u.withdrawSuspendedUntil > Date.now()) {
+    const until = new Date(u.withdrawSuspendedUntil).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' });
+    return res.status(403).json({ error: `Your withdrawals are on hold until ${until}${u.withdrawSuspendedReason ? ' — ' + u.withdrawSuspendedReason : ''}. You can withdraw after this date.` });
+  }
+  // Withdrawals open 7 days after joining, then once every 7 days.
+  const lastWdAt = (data.withdrawals || [])
+    .filter(w => w.userId === u.id && w.status !== 'rejected')
+    .reduce((m, w) => Math.max(m, w.at || 0), 0);
+  const refAt = Math.max(u.createdAt || 0, lastWdAt);
+  if (refAt && Date.now() - refAt < holdMs) {
+    const d = new Date(refAt + holdMs).toLocaleDateString('en-KE', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+    return res.status(400).json({ error: `Withdrawals run every 7 days. Your next withdrawal window opens on ${d}.` });
+  }
   if (!amt || amt < min) return res.status(400).json({ error: `Minimum withdrawal is KES ${min}.` });
   if (amt > u.wallet) return res.status(400).json({ error: 'Insufficient balance.' });
   if (!phone || !/^(\+?254|0)\d{9}$/.test(String(phone).replace(/\s/g, ''))) {
@@ -575,7 +678,18 @@ app.post('/api/wallet/withdraw', requireAuth, (req, res) => {
 app.get('/api/wallet/withdrawals', requireAuth, (req, res) => {
   const data = db.load();
   const mine = (data.withdrawals || []).filter(w => w.userId === req.user.id);
-  res.json({ withdrawals: mine.slice(0, 30) });
+  const u = req.user;
+  const holdMs = (data.settings.withdrawalHoldDays || 7) * 86400000;
+  const lastWdAt = mine.filter(w => w.status !== 'rejected').reduce((m, w) => Math.max(m, w.at || 0), 0);
+  const refAt = Math.max(u.createdAt || 0, lastWdAt);
+  const nextAt = refAt ? refAt + holdMs : 0;
+  res.json({
+    withdrawals: mine.slice(0, 30),
+    holdDays: data.settings.withdrawalHoldDays || 7,
+    nextWithdrawalAt: nextAt > Date.now() ? nextAt : 0,
+    withdrawSuspendedUntil: (u.withdrawSuspendedUntil && u.withdrawSuspendedUntil > Date.now()) ? u.withdrawSuspendedUntil : 0,
+    withdrawSuspendedReason: u.withdrawSuspendedReason || ''
+  });
 });
 
 /* ------------------------------- marketplace ------------------------------- */
@@ -700,7 +814,7 @@ app.get('/api/admin/stats', requireAdmin, (req, res) => {
 
 app.get('/api/admin/users', requireAdmin, (req, res) => {
   const data = db.load();
-  res.json({ users: data.users.map(u => ({ id: u.id, name: u.name, email: u.email, wallet: u.wallet, tier: u.tier, verified: u.verified, testPassed: u.testPassed, suspended: u.suspended, createdAt: u.createdAt })) });
+  res.json({ users: data.users.map(u => ({ id: u.id, name: u.name, email: u.email, wallet: u.wallet, tier: u.tier, unlockedPackages: u.unlockedPackages || [], verified: u.verified, testPassed: u.testPassed, suspended: u.suspended, createdAt: u.createdAt, withdrawSuspendedUntil: u.withdrawSuspendedUntil || 0, withdrawSuspendedReason: u.withdrawSuspendedReason || '' })) });
 });
 
 app.post('/api/admin/users/:id/tier', requireAdmin, (req, res) => {
@@ -709,9 +823,31 @@ app.post('/api/admin/users/:id/tier', requireAdmin, (req, res) => {
   if (!u) return res.status(404).json({ error: 'User not found.' });
   const tier = (req.body || {}).tier;
   if (!PACKAGES[tier]) return res.status(400).json({ error: 'Invalid package.' });
+  // A tier must NEVER be granted for free, even by admin: it can only be set
+  // when the package was genuinely paid for and unlocked.
+  if (!hasUnlockedPackage(u, tier)) return res.status(400).json({ error: 'This user has not paid to unlock that package. No free packages can be granted.' });
   u.tier = tier;
   db.save();
   res.json({ ok: true });
+});
+
+/* Close (revoke) a member's package from the backend: removes the unlock and
+   re-syncs the active tier to the highest package they still own (or none).
+   Their wallet, submissions and history are never touched. */
+app.post('/api/admin/users/:id/package/close', requireAdmin, (req, res) => {
+  const data = db.load();
+  const u = data.users.find(x => x.id === req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  const key = String((req.body || {}).key || u.tier || '');
+  if (!key || !hasUnlockedPackage(u, key)) return res.status(400).json({ error: 'That package is not unlocked on this account.' });
+  u.unlockedPackages = (u.unlockedPackages || []).filter(k => k !== key);
+  const wasActive = u.tier === key;
+  if (wasActive) u.tier = null;
+  const best = highestUnlockedTier(u);
+  if (best) u.tier = best; // fall back to their next-highest owned package, if any
+  notify(u.id, `Your ${PACKAGES[key].name} package has been closed by the platform. ${best ? `Your active package is now ${PACKAGES[best].name}.` : 'You currently have no active package.'} Contact support if you believe this is a mistake.`, 'info');
+  db.saveNow();
+  res.json({ ok: true, tier: u.tier, unlockedPackages: u.unlockedPackages });
 });
 
 app.post('/api/admin/users/:id/suspend', requireAdmin, (req, res) => {
@@ -732,9 +868,51 @@ app.post('/api/admin/users/:id/adjust', requireAdmin, (req, res) => {
   res.json({ ok: true, tx });
 });
 
+/* Suspend (or re-open) a member's ability to WITHDRAW until a given date,
+   with a reason. The member sees it as an announcement on their profile. */
+app.post('/api/admin/users/:id/withdraw-suspend', requireAdmin, (req, res) => {
+  const data = db.load();
+  const u = data.users.find(x => x.id === req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  const until = Number((req.body || {}).until) || 0;
+  const reason = String((req.body || {}).reason || '').slice(0, 300);
+  if (!until || until <= Date.now()) {
+    u.withdrawSuspendedUntil = 0;
+    u.withdrawSuspendedReason = '';
+    notify(u.id, 'Your withdrawals are open again — you can withdraw as normal.', 'success');
+  } else {
+    u.withdrawSuspendedUntil = until;
+    u.withdrawSuspendedReason = reason;
+    const d = new Date(until).toLocaleDateString('en-KE', { day: 'numeric', month: 'long', year: 'numeric' });
+    notify(u.id, `Your withdrawals are on hold until ${d}.${reason ? ' Reason: ' + reason : ''} Your earnings stay safe in your wallet and you can withdraw after this date.`, 'info');
+  }
+  db.saveNow();
+  res.json({ ok: true });
+});
+
+/* Admin → user announcement: a message pinned on the member's profile (and in
+   notifications). Used e.g. to explain why a pending payout is being held. */
+app.post('/api/admin/users/:id/announce', requireAdmin, (req, res) => {
+  const data = db.load();
+  const u = data.users.find(x => x.id === req.params.id);
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  const title = String((req.body || {}).title || 'Notice from Upwork Kenya').slice(0, 80);
+  const message = String((req.body || {}).message || '').slice(0, 600);
+  if (!message) return res.status(400).json({ error: 'Write the announcement message.' });
+  data.announcements = data.announcements || [];
+  data.announcements.unshift({ id: db.uid('ann'), userId: u.id, title, message, at: Date.now() });
+  notify(u.id, `📢 ${title}: ${message}`, 'info');
+  db.saveNow();
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/withdrawals', requireAdmin, (req, res) => {
   const data = db.load();
-  res.json({ withdrawals: (data.withdrawals || []).slice(0, 100) });
+  const rows = (data.withdrawals || []).slice(0, 100).map(w => {
+    const u = data.users.find(x => x.id === w.userId);
+    return { ...w, userName: u ? u.name : w.userId, userEmail: u ? u.email : '' };
+  });
+  res.json({ withdrawals: rows });
 });
 
 /* Withdrawal lifecycle: pending → approved (admin okays it) → cleared (admin has sent
@@ -746,7 +924,7 @@ app.post('/api/admin/withdrawals/:id', requireAdmin, (req, res) => {
   if (!w) return res.status(404).json({ error: 'Not found.' });
   let next = String((req.body || {}).status || '');
   if (next === 'paid') next = 'cleared';
-  if (['approved', 'cleared', 'rejected'].indexOf(next) === -1) return res.status(400).json({ error: 'Invalid status.' });
+  if (['approved', 'cleared', 'rejected', 'partial'].indexOf(next) === -1) return res.status(400).json({ error: 'Invalid status.' });
   if (w.status === 'cleared' || w.status === 'paid') return res.status(400).json({ error: 'Already cleared — money was sent.' });
   if (w.status === 'rejected') return res.status(400).json({ error: 'Already rejected and refunded.' });
   if (next === 'approved') {
@@ -754,6 +932,28 @@ app.post('/api/admin/withdrawals/:id', requireAdmin, (req, res) => {
     w.status = 'approved';
     w.approvedAt = Date.now();
     notify(w.userId, `Your withdrawal of KES ${w.amount} was approved ✅ — the payout is being sent to M-Pesa ${w.phone}.`, 'success');
+  } else if (next === 'partial') {
+    /* Partial payout: send only what is on hand. The user sees exactly how much
+       is verified and how much is still pending, and the balance can be
+       verified later with the same action. */
+    if (w.status !== 'pending' && w.status !== 'approved') return res.status(400).json({ error: 'Only open requests can receive a partial payout.' });
+    const payAmt = Math.floor(Number((req.body || {}).amount));
+    const remaining = w.amount - (w.paidAmount || 0);
+    if (!payAmt || payAmt <= 0) return res.status(400).json({ error: 'Enter the amount you are paying now.' });
+    if (payAmt > remaining) return res.status(400).json({ error: 'Only KES ' + remaining.toLocaleString('en-KE') + ' remains on this request.' });
+    w.paidAmount = (w.paidAmount || 0) + payAmt;
+    w.payouts = w.payouts || [];
+    w.payouts.push({ amount: payAmt, at: Date.now(), note: String((req.body || {}).note || '') });
+    const left = w.amount - w.paidAmount;
+    if (left <= 0) {
+      w.status = 'cleared';
+      w.clearedAt = Date.now();
+      notify(w.userId, `💸 Your withdrawal of KES ${w.amount} is FULLY verified — the final KES ${payAmt} was sent to M-Pesa ${w.phone}. Asante!`, 'success');
+    } else {
+      w.status = 'approved';
+      w.approvedAt = Date.now();
+      notify(w.userId, `✅ KES ${payAmt} of your KES ${w.amount} withdrawal is verified and sent to M-Pesa ${w.phone}. The remaining KES ${left} is pending — it will be verified shortly.`, 'success');
+    }
   } else if (next === 'cleared') {
     w.status = 'cleared';
     w.clearedAt = Date.now();
@@ -770,7 +970,53 @@ app.post('/api/admin/withdrawals/:id', requireAdmin, (req, res) => {
 
 app.get('/api/admin/assignments', requireAdmin, (req, res) => {
   const data = db.load();
-  res.json({ assignments: data.assignments.slice(0, 100) });
+  // Attach the member's display name so the admin panel can show WHO submitted each task.
+  const rows = data.assignments.slice(0, 100).map(a => {
+    const u = data.users.find(x => x.id === a.userId);
+    return { ...a, userName: u ? u.name : '' };
+  });
+  res.json({ assignments: rows });
+});
+
+/* Every task submission enters VERIFICATION: admin reviews the scanned file
+   and either approves (earnings are released to the wallet) or rejects (with a
+   reason the user sees, and they may re-submit). */
+app.post('/api/admin/assignments/:id', requireAdmin, (req, res) => {
+  const data = db.load();
+  const a = data.assignments.find(x => x.id === req.params.id);
+  if (!a) return res.status(404).json({ error: 'Not found.' });
+  const next = String((req.body || {}).status || '');
+  if (a.status !== 'pending') return res.status(400).json({ error: 'Already decided.' });
+  if (next === 'approved') {
+    a.status = 'approved';
+    a.approvedAt = Date.now();
+    addTx(a.userId, 'earning', a.net, `Task: ${a.title} (gross KES ${a.gross}, platform fee KES ${a.fee})`);
+    notify(a.userId, `🎉 Verified & paid — KES ${a.net} was added to your wallet for "${a.title}".`, 'success');
+    const u = data.users.find(x => x.id === a.userId);
+    if (u) checkTierUpgrade(u);
+  } else if (next === 'rejected') {
+    a.status = 'rejected';
+    a.rejectedAt = Date.now();
+    a.reviewNote = String((req.body || {}).note || 'Does not meet the brief').slice(0, 300);
+    notify(a.userId, `⚠️ "${a.title}" did not pass verification: ${a.reviewNote}. You can redo the task and submit it again.`, 'info');
+  } else {
+    return res.status(400).json({ error: 'Invalid status.' });
+  }
+  db.saveNow();
+  res.json({ ok: true });
+});
+
+/* Download a submitted deliverable file (review without opening the DB). */
+app.get('/api/admin/assignments/:id/file', requireAdmin, (req, res) => {
+  const data = db.load();
+  const a = data.assignments.find(x => x.id === req.params.id);
+  if (!a || !a.fileData) return res.status(404).json({ error: 'No file attached.' });
+  const m = /^data:([^;,]+)?;base64,(.*)$/s.exec(a.fileData);
+  if (!m) return res.status(400).json({ error: 'Stored file is unreadable.' });
+  const buf = Buffer.from(m[2], 'base64');
+  res.setHeader('Content-Type', m[1] || 'application/octet-stream');
+  res.setHeader('Content-Disposition', 'inline; filename="' + String(a.fileName || 'delivery').replace(/["\r\n]/g, '') + '"');
+  res.send(buf);
 });
 
 app.get('/api/admin/deposits', requireAdmin, (req, res) => {
@@ -808,6 +1054,70 @@ app.get('/api/admin/payments', requireAdmin, (req, res) => {
     };
   });
   res.json({ payments: rows });
+});
+
+/* PLATFORM WALLET — totals of every shilling the backend has received:
+   successful STK payments, split into package unlocks, verification fees and
+   wallet deposits, plus a full ledger. */
+app.get('/api/admin/wallet', requireAdmin, (req, res) => {
+  const data = db.load();
+  const ok = (data.payments || []).filter(p => p.status === 'success');
+  const sumBy = fn => ok.filter(fn).reduce((s, p) => s + (p.amount || 0), 0);
+  const ledger = ok.slice(0, 200).map(p => {
+    const u = data.users.find(x => x.id === p.userId);
+    return { id: p.id, user: u ? u.name : p.userId, amount: p.amount, purpose: p.purpose, packageKey: p.packageKey || '', receipt: p.mpesaReceipt || '', reference: p.reference, at: p.createdAt };
+  });
+  // Manual M-Pesa deposits confirmed by the admin are successful money IN too.
+  // (STK deposits already have a successful payment row AND method 'kcb_stk' —
+  //  those are excluded here so they are never double-counted.)
+  const manualDeposits = (data.deposits || []).filter(d => d.status === 'approved' && d.method !== 'kcb_stk');
+  const manualDepositVolume = manualDeposits.reduce((s, d) => s + (d.amount || 0), 0);
+  // PAYOUTS — money actually SENT to users: cleared withdrawals count in full;
+  // partially paid requests count what has been paid so far.
+  const payouts = (data.withdrawals || [])
+    .filter(w => w.status === 'cleared' || w.status === 'paid' || (w.paidAmount || 0) > 0)
+    .map(w => {
+      const u = data.users.find(x => x.id === w.userId);
+      const paid = (w.status === 'cleared' || w.status === 'paid') ? (w.paidAmount || w.amount) : w.paidAmount;
+      return { id: w.id, user: u ? u.name : w.userId, phone: w.phone, amount: paid, requested: w.amount, at: w.clearedAt || w.at };
+    });
+  const totalPaidOut = payouts.reduce((s, p) => s + (p.amount || 0), 0);
+  // Every successful transaction into the platform (STK + admin-confirmed manual deposits).
+  const totalReceived = ok.reduce((s, p) => s + (p.amount || 0), 0) + manualDepositVolume;
+  res.json({
+    totalReceived,
+    packageRevenue: sumBy(p => p.purpose === 'package'),
+    verificationRevenue: sumBy(p => p.purpose === 'verify'),
+    depositVolume: sumBy(p => p.purpose === 'deposit'),
+    manualDepositVolume,
+    totalPaidOut,                                   // total paid out to users
+    walletBalance: totalReceived - totalPaidOut,    // paying a user minuses from the total wallet
+    payoutCount: payouts.length,
+    payouts: payouts.slice(0, 200),
+    paymentsCount: ok.length,
+    pendingCount: (data.payments || []).filter(p => p.status === 'pending').length,
+    ledger
+  });
+});
+
+/* ADMIN: complete a stuck/interfered payment with the real M-Pesa code.
+   When the callback and the status query both failed but the M-Pesa and bank
+   confirmations show the money arrived, the admin enters the receipt code here
+   and the transaction completes — exactly what the payment unlocks fires. */
+app.post('/api/admin/payments/:id/complete', requireAdmin, (req, res) => {
+  const data = db.load();
+  const p = (data.payments || []).find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Not found.' });
+  if (p.status === 'success') return res.json({ ok: true });
+  if (p.status === 'cancelled') return res.status(400).json({ error: 'Payment cancelled — it cannot be completed. Ask the user to try again.' });
+  const code = String((req.body || {}).receipt || '').trim().toUpperCase();
+  if (!MPESA_CODE_RE.test(code)) return res.status(400).json({ error: 'Enter the exact 10-character M-Pesa confirmation code (e.g. QGH1ABC2XY).' });
+  if ((data.payments || []).some(x => x.mpesaReceipt && x.mpesaReceipt === code && x.id !== p.id)) {
+    return res.status(409).json({ error: 'That code already belongs to another transaction.' });
+  }
+  p.manualReview = true;
+  finalizePayment(p.id, 0, 'Completed by admin with M-Pesa receipt ' + code + ' (verified against M-Pesa/bank confirmation)', code);
+  res.json({ ok: true });
 });
 
 /* ------------------------- KCB Buni M-Pesa STK push -------------------------- */
