@@ -972,11 +972,11 @@ app.get('/api/pay/kcb/status/:id', requireAuth, async (req, res) => {
     if (q && q.code === 0) finalizePayment(p.id, 0, q.desc || 'The service request is processed successfully.', q.receipt);
   }
   // If the user entered their PIN but the gateway callback never arrived (network
-  // drop, cold start, case-mismatched callback URL), stop waiting after 2 minutes:
+  // drop, cold start, case-mismatched callback URL), stop waiting after 60s:
   // mark the request 'timeout' so the frontend offers the M-Pesa confirmation-code
   // fallback (payment completes instantly if the SMS arrived) or a clean retry.
-  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 120000) {
-    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 2 minutes. If you received the M-Pesa SMS, enter its confirmation code to finish.');
+  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 60000) {
+    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 60 seconds. If you received the M-Pesa SMS, enter its confirmation code to finish.');
   }
   res.json({ id: p.id, status: p.status, amount: p.amount, resultCode: p.resultCode, resultDesc: p.resultDesc, mpesaReceipt: p.mpesaReceipt, wallet: req.user.wallet });
 });
