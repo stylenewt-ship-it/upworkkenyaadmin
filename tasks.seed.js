@@ -7,6 +7,7 @@
  */
 
 const CATEGORIES = [
+  'Assignments',
   'Article Writing',
   'Poster Design',
   'Data Entry',
@@ -18,6 +19,8 @@ const CATEGORIES = [
 ];
 
 const TEMPLATES = [
+  { cat: 'Assignments', title: 'Complete a short client assignment: "{topic}"', desc: 'Follow the attached brief, produce the requested document/slides and submit before the deadline. Quality is checked on submission.' },
+  { cat: 'Assignments', title: 'Handle a same-day micro assignment', desc: 'A quick-turnaround client task (30–60 minutes). Read the brief carefully and submit exactly what is requested.' },
   { cat: 'Article Writing', title: 'Write a 600-word blog post: "{topic}"', desc: 'Original, well-structured blog post with a headline, intro, 3 sub-sections and a conclusion. UK/US English, no plagiarism.' },
   { cat: 'Article Writing', title: 'Summarise a report into a 300-word article', desc: 'Read the attached brief and produce a crisp 300-word summary suitable for a company newsletter.' },
   { cat: 'Poster Design', title: 'Design an A4 promo poster: "{topic}"', desc: 'Clean, modern A4 poster (PNG/PDF). Include headline, date, venue and a call-to-action. Brand colours provided.' },

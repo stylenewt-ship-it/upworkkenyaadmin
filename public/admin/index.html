@@ -104,7 +104,11 @@
 
 <script>
 'use strict';
-let KEY = sessionStorage.getItem('uk_admin_key') || '';
+/* Admin session survives tab closes, browser restarts and server restarts —
+   the admin stays logged in until they press Lock themselves. The server-side
+   session is persistent (30-day sliding expiry), so the key stored here keeps
+   working across redeploys too. */
+let KEY = localStorage.getItem('uk_admin_key') || '';
 const $ = id => document.getElementById(id);
 function toast(m){ const t=$('toast'); t.textContent=m; t.style.display='block'; setTimeout(()=>t.style.display='none',3000); }
 function money(n){ return 'KES ' + Number(n||0).toLocaleString('en-KE'); }
@@ -127,15 +131,15 @@ $('gateForm').addEventListener('submit', async e => {
     const d = await r.json().catch(()=>({}));
     if (!r.ok || !d.key) throw new Error(d.error || 'Login failed');
     KEY = d.key;
-    sessionStorage.setItem('uk_admin_key', KEY);
+    localStorage.setItem('uk_admin_key', KEY);
     $('gatePw').value = '';
     enter();
-  } catch { $('gateErr').style.display='block'; KEY=''; sessionStorage.removeItem('uk_admin_key'); }
+  } catch { $('gateErr').style.display='block'; KEY=''; localStorage.removeItem('uk_admin_key'); }
 });
 
 function enter(){ $('gate').style.display='none'; $('shell').style.display='block'; loadAll(); }
-function logout(){ sessionStorage.removeItem('uk_admin_key'); location.reload(); }
-if (KEY) { api('/api/admin/stats').then(enter).catch(()=>{ KEY=''; sessionStorage.removeItem('uk_admin_key'); }); }
+function logout(){ try{ fetch('/api/admin/logout',{method:'POST',headers:{'x-admin-key':KEY}}).catch(function(){}); }catch(e){} localStorage.removeItem('uk_admin_key'); location.reload(); }
+if (KEY) { api('/api/admin/stats').then(enter).catch(()=>{ KEY=''; localStorage.removeItem('uk_admin_key'); }); }
 
 document.querySelectorAll('.nav-item').forEach(b => b.onclick = () => {
   document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));

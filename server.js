@@ -70,10 +70,29 @@ function rateLimit(max, windowMs) {
 }
 setInterval(() => { const now = Date.now(); for (const [k, b] of rateBuckets) if (now - b.start > 15 * 60 * 1000) rateBuckets.delete(k); }, 10 * 60 * 1000).unref();
 
-/* Admin session tokens (in-memory, 12h, sliding). The admin password itself is
-   NEVER sent to the browser or used as an API key. */
-const adminSessions = new Map();
-setInterval(() => { const now = Date.now(); for (const [k, exp] of adminSessions) if (exp < now) adminSessions.delete(k); }, 30 * 60 * 1000).unref();
+/* Admin session tokens: PERSISTENT (stored in the durable datastore, mirrored
+   to Neon Postgres), with a 30-day sliding expiry. The admin stays logged in
+   until THEY press Lock — server restarts, redeploys and browser restarts
+   never kick them out. The admin password itself is NEVER sent to the browser
+   or used as an API key. */
+const ADMIN_SESSION_MS = 30 * 24 * 3600 * 1000;
+function adminSessions() { const d = db.load(); d.adminSessions = d.adminSessions || {}; return d.adminSessions; }
+function adminSessGet(key) {
+  if (!key) return 0;
+  const rec = adminSessions()[key];
+  if (!rec) return 0;
+  if (rec.expiresAt < Date.now()) { delete adminSessions()[key]; db.save(); return 0; }
+  return rec.expiresAt;
+}
+function adminSessSet(key) {
+  const s = adminSessions();
+  s[key] = { createdAt: (s[key] || {}).createdAt || Date.now(), expiresAt: Date.now() + ADMIN_SESSION_MS };
+  db.saveNow(); // flush immediately so the session survives a restart that follows right after login
+}
+function adminSessDel(key) {
+  const s = adminSessions();
+  if (s[key]) { delete s[key]; db.saveNow(); }
+}
 
 /* The admin panel exists ONLY at the hidden /<ADMIN_PATH> route and is invisible to
    crawlers. Common admin-discovery probes get a plain 404 — nothing to fingerprint. */
@@ -128,9 +147,9 @@ function requireAuth(req, res, next) {
 
 function requireAdmin(req, res, next) {
   const key = req.headers['x-admin-key'] || '';
-  const exp = adminSessions.get(key);
+  const exp = adminSessGet(key);
   if (!exp || exp < Date.now()) return res.status(401).json({ error: 'Invalid admin credentials.' });
-  adminSessions.set(key, Date.now() + 12 * 3600 * 1000); // sliding 12h session
+  adminSessSet(key); // sliding 30-day session — refreshed on every admin action
   next();
 }
 
@@ -649,8 +668,16 @@ app.post('/api/admin/login', rateLimit(5, 60 * 1000), (req, res) => {
   const ok = a.length === b.length && crypto.timingSafeEqual(a, b); // timing-safe compare
   if (!ok) return res.status(401).json({ error: 'Wrong password.' });
   const key = token();
-  adminSessions.set(key, Date.now() + 12 * 3600 * 1000);
+  adminSessSet(key); // persistent 30-day sliding session — survives restarts/redeploys
   res.json({ ok: true, key }); // random session token — the real password never leaves the server
+});
+
+/* Explicit logout: pressing Lock in the admin panel revokes the session
+   server-side too, so the key is dead immediately afterwards. */
+app.post('/api/admin/logout', (req, res) => {
+  const key = req.headers['x-admin-key'] || '';
+  if (key) adminSessDel(key);
+  res.json({ ok: true });
 });
 
 app.get('/api/admin/stats', requireAdmin, (req, res) => {
@@ -798,19 +825,37 @@ const KCB = {
   // NB: KCB's gateway validates the callback URL case-sensitively — keep the host lowercase.
   baseUrl: (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '').toLowerCase(),
   callbackUrl: process.env.CALLBACK_URL || '',
-  // Demo mode: when consumer key/secret are missing, STK-push endpoints simulate a
-  // successful transaction locally so the flow (enter number → enter PIN → confirm →
-  // package unlocked / verified / deposited) still works end-to-end.
-  demoMode: !(process.env.KCB_CONSUMER_KEY && process.env.KCB_CONSUMER_SECRET)
+  // Demo mode: simulate a successful STK transaction end-to-end (enter number →
+  // enter PIN → confirm → unlocked). Forced ON with KCB_DEMO=true (testing), or
+  // when no consumer key/secret are configured. Real payments run when it's off.
+  demoMode: String(process.env.KCB_DEMO || '').toLowerCase() === 'true' || !(process.env.KCB_CONSUMER_KEY && process.env.KCB_CONSUMER_SECRET)
 };
 
 let kcbTokenCache = { value: null, expiresAt: 0 };
+
+/* fetch with a small built-in retry for transient network/5xx blips (Render
+   cold starts, KCB gateway hiccups): one retry after 1.2s before giving up. */
+async function fetchRetry(url, opts, tries) {
+  const n = tries || 2;
+  let lastErr = null;
+  for (let i = 0; i < n; i++) {
+    try {
+      const r = await fetch(url, opts);
+      if (r.status >= 500 && i + 1 < n) { await new Promise(r2 => setTimeout(r2, 1200)); continue; }
+      return r;
+    } catch (e) {
+      lastErr = e;
+      if (i + 1 < n) await new Promise(r2 => setTimeout(r2, 1200));
+    }
+  }
+  throw lastErr || new Error('Network error reaching the payment gateway.');
+}
 
 async function kcbAccessToken() {
   if (!KCB.key || !KCB.secret) throw new Error('KCB API credentials are not configured on the server.');
   if (kcbTokenCache.value && Date.now() < kcbTokenCache.expiresAt - 30000) return kcbTokenCache.value;
   const auth = Buffer.from(KCB.key + ':' + KCB.secret).toString('base64');
-  const r = await fetch(KCB.tokenUrl + '?grant_type=client_credentials', {
+  const r = await fetchRetry(KCB.tokenUrl + '?grant_type=client_credentials', {
     method: 'POST',
     headers: { Authorization: 'Basic ' + auth }
   });
@@ -861,6 +906,32 @@ async function kcbQueryStatus(p) {
     }
   }
   return null;
+}
+
+/* AUTO-RECOVERY: when the user entered the correct PIN but KCB's callback was
+   lost AND the status query is unavailable, scan KCB's shared-short-code
+   payment feed for this transaction's invoice reference. A match completes the
+   payment automatically — no M-Pesa code entry needed. Requires the
+   transaction-status/payments feed to be enabled on the Buni app (override via
+   KCB_TRANSACTIONS_ENDPOINT); returns null quietly when unavailable, in which
+   case the callback flow is completely unaffected. */
+const KCB_TX_URL = process.env.KCB_TRANSACTIONS_ENDPOINT || 'https://api.buni.kcbgroup.com/transaction/status/2.0.0/payments.json';
+async function kcbFindPayment(p) {
+  try {
+    if (KCB.shortCode !== '522522' && !process.env.KCB_TRANSACTIONS_ENDPOINT) return null; // feed exists for the shared short code
+    const acRef = String(p.invoiceNumber || '').split('#')[1] || '';
+    if (!acRef) return null;
+    const jwt = await kcbAccessToken();
+    const r = await fetchRetry(KCB_TX_URL + '?shortCode=' + encodeURIComponent(KCB.shortCode), { headers: { Authorization: 'Bearer ' + jwt } }, 1);
+    if (!r.ok) return null;
+    const arr = await r.json().catch(() => null);
+    const rows = Array.isArray(arr) ? arr : ((arr && (arr.payments || arr.transactions || arr.data)) || []);
+    const hit = rows.find(x => String(x.accountreference || x.accountReference || '').toUpperCase() === acRef.toUpperCase());
+    if (!hit) return null;
+    const receipt = String(hit.transactionreference || hit.transactionReference || '').trim();
+    const amount = Number(hit.amount) || undefined;
+    return receipt ? { receipt, amount } : null;
+  } catch { return null; }
 }
 
 /* Initiate an STK push. `purpose` decides what the successful payment unlocks:
@@ -916,7 +987,7 @@ app.post('/api/pay/kcb/stkpush', requireAuth, rateLimit(12, 60 * 1000), async (r
     }
 
     const jwt = await kcbAccessToken();
-    const r = await fetch(KCB.stkUrl, {
+    const r = await fetchRetry(KCB.stkUrl, {
       method: 'POST',
       headers: { Authorization: 'Bearer ' + jwt, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -970,13 +1041,23 @@ app.get('/api/pay/kcb/status/:id', requireAuth, async (req, res) => {
     db.save();
     const q = await kcbQueryStatus(p);
     if (q && q.code === 0) finalizePayment(p.id, 0, q.desc || 'The service request is processed successfully.', q.receipt);
+    else if (q && q.code === 1032) finalizePayment(p.id, 1032, q.desc || 'Request cancelled by user.');
+    // any other query result ("still processing" etc.) — keep waiting for the callback
   }
-  // If the user entered their PIN but the gateway callback never arrived (network
-  // drop, cold start, case-mismatched callback URL), stop waiting after 60s:
-  // mark the request 'timeout' so the frontend offers the M-Pesa confirmation-code
-  // fallback (payment completes instantly if the SMS arrived) or a clean retry.
-  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 45000) {
-    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 45 seconds. If you received the M-Pesa SMS, enter its confirmation code to finish.');
+  /* AUTO-RECOVERY: after 45s of silence, try the M-Pesa payment feed once — if
+     the PIN went through, the payment completes here automatically even when
+     both the callback and the status query failed. */
+  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 45000 && !p.autoRecovered) {
+    p.autoRecovered = true;
+    db.save();
+    const found = await kcbFindPayment(p);
+    if (found) finalizePayment(p.id, 0, 'Auto-recovered from the M-Pesa payment feed.', found.receipt, found.amount);
+  }
+  // Only after 100 seconds of TOTAL silence (callback lost, query unavailable,
+  // feed empty) surface the M-Pesa confirmation-code fallback — by then the
+  // SMS has definitely arrived if the payment went through.
+  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 100000) {
+    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 100 seconds. If you received the M-Pesa SMS, enter its confirmation code to finish.');
   }
   res.json({ id: p.id, status: p.status, amount: p.amount, resultCode: p.resultCode, resultDesc: p.resultDesc, mpesaReceipt: p.mpesaReceipt, wallet: req.user.wallet });
 });
@@ -1082,8 +1163,10 @@ function finalizePayment(paymentId, code, desc, receipt, amount) {
     }
   } else if (code === 1032) p.status = 'cancelled';
   else if (code === 1037) p.status = 'timeout';
-  else if (code === 1 || code === 1001 || code === 9999) {
+  else if (code === 1 || code === 1001 || code === 9999 || Number.isNaN(code) || /process/i.test(desc || '')) {
     // Gateway says "still being processed" — keep waiting, never fail the payment.
+    // Covers Safaricom's non-numeric "500.001.1001" processing code, which
+    // arrives as a string ResultCode (Number() -> NaN) and must NOT be failed.
     p.resultDesc = desc || p.resultDesc;
     db.saveNow();
     return;

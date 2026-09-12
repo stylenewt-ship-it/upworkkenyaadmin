@@ -40,6 +40,7 @@ function seedData() {
     meta: { version: 1, seededAt: now },
     users: [],
     sessions: {},          // token -> { userId, createdAt }
+    adminSessions: {},     // admin token -> { createdAt, expiresAt } — persistent, 30-day sliding
     resetTokens: {},       // token -> { email, expiresAt }
     tasks: [],             // available task pool
     assignments: [],       // user task assignments
