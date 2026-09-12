@@ -789,12 +789,12 @@ const KCB = {
   key: process.env.KCB_CONSUMER_KEY || '',
   secret: process.env.KCB_CONSUMER_SECRET || '',
   tokenUrl: process.env.KCB_TOKEN_ENDPOINT || 'https://api.buni.kcbgroup.com/token',
-  stkUrl: process.env.KCB_STKPUSH_ENDPOINT || 'https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush',
+  stkUrl: process.env.KCB_STK_ENDPOINT || process.env.KCB_STKPUSH_ENDPOINT || 'https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkpush',
   // Optional transaction-status query endpoint (set KCB_QUERY_ENDPOINT if your Buni app has it enabled).
   queryUrl: process.env.KCB_QUERY_ENDPOINT || 'https://api.buni.kcbgroup.com/mm/api/request/1.0.0/stkquery',
-  shortCode: process.env.KCB_SHORT_CODE || '522522',          // KCB shared short code
+  shortCode: process.env.KCB_SHORTCODE || process.env.KCB_SHORT_CODE || '522522',   // KCB short code (accepts both env names)
   passKey: process.env.KCB_PASSKEY || '',                     // empty when using the shared short code
-  till: process.env.KCB_TILL_NUMBER || process.env.KCB_SHORT_CODE || '522522',
+  till: process.env.KCB_TILL || process.env.KCB_TILL_NUMBER || process.env.KCB_SHORTCODE || process.env.KCB_SHORT_CODE || '522522',
   // NB: KCB's gateway validates the callback URL case-sensitively — keep the host lowercase.
   baseUrl: (process.env.BASE_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '').toLowerCase(),
   callbackUrl: process.env.CALLBACK_URL || '',
@@ -923,7 +923,7 @@ app.post('/api/pay/kcb/stkpush', requireAuth, rateLimit(12, 60 * 1000), async (r
         phoneNumber: phone,
         amount: String(amt),
         invoiceNumber: invoiceNumber,
-        sharedShortCode: true,
+        sharedShortCode: KCB.shortCode === '522522',
         orgShortCode: KCB.shortCode,
         orgPassKey: KCB.passKey,
         callbackUrl: KCB.callbackUrl || (KCB.baseUrl + '/api/pay/kcb/callback'),
@@ -965,7 +965,7 @@ app.get('/api/pay/kcb/status/:id', requireAuth, async (req, res) => {
   // ACTIVE CONFIRMATION: while still pending, ask the gateway directly for the
   // result (throttled to once every 5s). If the user's PIN already went through,
   // the payment completes here in seconds even when KCB's callback is slow or lost.
-  if (p.status === 'pending' && !KCB.demoMode && (!p.lastQueryAt || Date.now() - p.lastQueryAt > 5000)) {
+  if (p.status === 'pending' && !KCB.demoMode && (!p.lastQueryAt || Date.now() - p.lastQueryAt > 3000)) {
     p.lastQueryAt = Date.now();
     db.save();
     const q = await kcbQueryStatus(p);
@@ -975,8 +975,8 @@ app.get('/api/pay/kcb/status/:id', requireAuth, async (req, res) => {
   // drop, cold start, case-mismatched callback URL), stop waiting after 60s:
   // mark the request 'timeout' so the frontend offers the M-Pesa confirmation-code
   // fallback (payment completes instantly if the SMS arrived) or a clean retry.
-  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 60000) {
-    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 60 seconds. If you received the M-Pesa SMS, enter its confirmation code to finish.');
+  if (p.status === 'pending' && !KCB.demoMode && Date.now() - p.createdAt > 45000) {
+    finalizePayment(p.id, 1037, 'No confirmation received from M-Pesa within 45 seconds. If you received the M-Pesa SMS, enter its confirmation code to finish.');
   }
   res.json({ id: p.id, status: p.status, amount: p.amount, resultCode: p.resultCode, resultDesc: p.resultDesc, mpesaReceipt: p.mpesaReceipt, wallet: req.user.wallet });
 });
