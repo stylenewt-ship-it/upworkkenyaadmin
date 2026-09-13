@@ -105,6 +105,41 @@ if (ADMIN_PATH) {
 }
 app.all(['/admin', '/admin/*', '/admin.html', '/administrator', '/wp-admin', '/wp-login.php', '/backend', '/manage'], (req, res) => res.status(404).send('Not found'));
 
+/* -------------------------- TEST-ACCOUNT GUARD -----------------------------
+   Removes synthetic QA/test accounts and everything they generated (payments,
+   deposits, withdrawals, transactions, assignments, sessions, notifications)
+   and BLOCKS those addresses from registering again. Runs once on every boot
+   and on every registration attempt, so test data can never come back — not
+   after a restart, a redeploy, or a Neon restore. Only synthetic patterns are
+   matched; every real customer account is untouched. */
+const TEST_EMAIL_RE = /^(test\d+|ref\d+|e2e-probe-[a-z0-9]+)@|^test@|^demo@|^fake@/i;
+const TEST_EMAIL_DOMAIN_RE = /@(example\.(com|org|net)|ex\.com|test\.(dev|co\.ke|com)|mailinator\.com|yopmail\.com|guerrillamail\.com|tempmail\.)$/i;
+const TEST_NAME_RE = /^(test user|refund t|e2e probe|demo user|fake user|test account|qa tester)/i;
+function isTestAccount(u) {
+  const em = String(u.email || '');
+  return TEST_EMAIL_RE.test(em) || TEST_EMAIL_DOMAIN_RE.test(em) || TEST_NAME_RE.test(String(u.name || '').trim());
+}
+function purgeTestData() {
+  const data = db.load();
+  const bad = new Set((data.users || []).filter(isTestAccount).map(u => u.id));
+  if (!bad.size) return 0;
+  data.users = (data.users || []).filter(u => !bad.has(u.id));
+  const owned = o => o && bad.has(o.userId);
+  data.transactions = (data.transactions || []).filter(t => !owned(t));
+  data.withdrawals = (data.withdrawals || []).filter(w => !owned(w));
+  data.deposits = (data.deposits || []).filter(d => !owned(d));
+  data.payments = (data.payments || []).filter(p => !owned(p));
+  data.assignments = (data.assignments || []).filter(a => !owned(a));
+  data.notifications = (data.notifications || []).filter(n => !owned(n));
+  data.gigs = (data.gigs || []).filter(g => !owned(g));
+  data.orders = (data.orders || []).filter(o => !owned(o) && !bad.has(o.clientId));
+  for (const t of Object.keys(data.sessions || {})) if (bad.has(data.sessions[t].userId)) delete data.sessions[t];
+  db.saveNow();
+  console.log('[cleanup] purged ' + bad.size + ' test account(s) and their records.');
+  return bad.size;
+}
+purgeTestData();
+
 /* ---------------------------------- auth ---------------------------------- */
 
 function hashPassword(pw, salt) {
@@ -178,6 +213,9 @@ app.post('/api/register', rateLimit(10, 60 * 1000), (req, res) => {
   if (String(password).length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   const data = db.load();
   const em = String(email).trim().toLowerCase();
+  if (TEST_EMAIL_RE.test(em) || TEST_EMAIL_DOMAIN_RE.test(em) || TEST_NAME_RE.test(String(name).trim())) {
+    return res.status(400).json({ error: 'Please use your real name and a real email address to register.' });
+  }
   if (data.users.some(u => u.email === em)) return res.status(409).json({ error: 'That email is already registered. Try logging in.' });
   const u = {
     id: db.uid('usr'),
